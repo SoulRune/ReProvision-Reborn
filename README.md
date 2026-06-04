@@ -3,6 +3,11 @@ Re-sign applications on your device.
 
 This project aims at making it easier to (re-)sign iOS and Apple Watch applications on a **jailbroken** iOS device, allowing users to avoid the 7-day limit of free certificates associated with their normal Apple account.
 
+### Maintenance status
+As of 2026, this fork is maintained with a conservative scope. The current focus is iOS support on jailbroken devices, and compatibility should be verified before assuming support for a specific iOS version, device, or jailbreak environment.
+
+tvOS and macOS are not a current maintenance focus for this fork. Changes in those areas may be accepted if they are well-tested, but users should not assume active support for those platforms.
+
 ### Features
 - Automatic re-signing of locally provisioned applications
 - Basic settings to configure alerts shown when applications are (re-)signed
@@ -31,6 +36,11 @@ Furthermore, while re-distribution of this software is allowed, support for modi
 
 ### Account Handling
 Like most provisioning software, ReProvision supports free and paid development Apple accounts. While crendentials are stored in the device's Keychain for subsequent re-use, they're only sent to Apple's iTunes Connect API for authentication.
+
+### Security-sensitive areas
+This project handles several security-sensitive workflows, including Apple account authentication, Keychain-stored credentials, provisioning API calls, code signing, URL scheme IPA installation, and the background signing daemon.
+
+Changes touching these areas should be reviewed carefully and tested against the relevant signing and installation flows. The project does not claim compatibility with untested Apple service changes or platform updates.
 
 ### AltStore vs ReProvision
 This fork of ReProvision uses the same techniques that AltStore uses to tackle provisioning, and by no means should be considered as a competitor.
