@@ -9,6 +9,8 @@ body:
       value: |
         Thanks for taking the time to report a bug. Do not include Apple ID passwords, app-specific passwords, session tokens, provisioning secrets, or other private account data in this issue.
 
+        This project is maintained with a conservative iOS-focused scope. Reports for tvOS, macOS, modified unofficial builds, piracy support, or general jailbreak support may be closed as out of scope.
+
   - type: input
     id: ios-version
     attributes:
@@ -70,6 +72,14 @@ body:
         - label: Background daemon
         - label: Other or not sure
 
+  - type: checkboxes
+    id: scope-confirmation
+    attributes:
+      label: Scope confirmation
+      options:
+        - label: I am reporting an issue with ReProvision Reborn on a jailbroken iOS device, not a modified unofficial build.
+          required: true
+
   - type: textarea
     id: error-message
     attributes:
@@ -107,4 +117,3 @@ body:
       description: Add screenshots, related issues, or other non-sensitive details that may help.
     validations:
       required: false
-
