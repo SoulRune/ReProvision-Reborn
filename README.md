@@ -58,7 +58,7 @@ As long as you have standard libraries for Xcode projects, the only dependencies
 3. Open ``ReProvision.xcworkspace``, and roll from there
 
 ## License and Third-Party Libraries
-Licensed under the AGPLv3 license. This project occupies specific third-party libraries, which have all been listed (and given credit to) in this [notice](https://raw.githubusercontent.com/sohsatoh/ReProvision/master/iOS/HTML/openSourceLicenses.html).
+Licensed under the AGPLv3 license. This project occupies specific third-party libraries, which have all been listed (and given credit to) in this [notice](https://raw.githubusercontent.com/sohsatoh/ReProvision-Reborn/master/iOS/HTML/openSourceLicenses.html).
 
 The software, ReProvision Reborn (and by extension, ``libReprovision`` as found in ``/Shared/``), and all consecutive copies of the software, are provided without warranty and AS-IS. **This project is NOT intended for piracy.**
 
