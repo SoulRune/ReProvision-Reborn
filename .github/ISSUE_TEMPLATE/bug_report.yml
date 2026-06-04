@@ -1,0 +1,110 @@
+name: Bug report
+description: Report a reproducible problem with ReProvision Reborn.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Do not include Apple ID passwords, app-specific passwords, session tokens, provisioning secrets, or other private account data in this issue.
+
+  - type: input
+    id: ios-version
+    attributes:
+      label: iOS version
+      description: Include the exact iOS version where the issue occurs.
+      placeholder: "Example: iOS 14.8"
+    validations:
+      required: true
+
+  - type: input
+    id: device-model
+    attributes:
+      label: Device model
+      description: Include the exact device model if possible.
+      placeholder: "Example: iPhone X"
+    validations:
+      required: true
+
+  - type: input
+    id: jailbreak-environment
+    attributes:
+      label: Jailbreak environment
+      description: Include the jailbreak name, version, package manager, and relevant bootstrap details if known.
+      placeholder: "Example: checkra1n 0.12.4, Cydia"
+    validations:
+      required: true
+
+  - type: input
+    id: reprovision-version
+    attributes:
+      label: ReProvision Reborn version or commit
+      description: Provide the installed version or the commit you built from.
+      placeholder: "Example: 0.8.x or commit SHA"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: apple-account-type
+    attributes:
+      label: Apple account type
+      options:
+        - Free Apple account
+        - Paid developer account
+        - Not sure
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: affected-area
+    attributes:
+      label: Affected area
+      description: Select all areas that apply.
+      options:
+        - label: Signing
+        - label: Re-signing
+        - label: Installation
+        - label: URL scheme
+        - label: Notifications
+        - label: Background daemon
+        - label: Other or not sure
+
+  - type: textarea
+    id: error-message
+    attributes:
+      label: Exact error message
+      description: Paste the exact error text shown by ReProvision Reborn or the system.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction-steps
+    attributes:
+      label: Reproduction steps
+      description: Provide a minimal sequence of steps that triggers the issue.
+      placeholder: |
+        1. Open ReProvision Reborn
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Do not include Apple ID passwords, app-specific passwords, session tokens, provisioning secrets, or private account data.
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Add screenshots, related issues, or other non-sensitive details that may help.
+    validations:
+      required: false
+

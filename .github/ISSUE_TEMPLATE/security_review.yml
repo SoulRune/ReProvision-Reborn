@@ -1,0 +1,55 @@
+name: Security review
+description: Suggest non-sensitive security hardening improvements.
+title: "[Security review]: "
+labels:
+  - security
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template only for non-sensitive hardening suggestions.
+
+        Do not disclose exploitable vulnerabilities, proof-of-concept exploit details, credentials, tokens, or private account data in a public issue. If the concern may be exploitable, use GitHub Security Advisories if available, or follow the private reporting guidance in `SECURITY.md`.
+
+  - type: dropdown
+    id: review-area
+    attributes:
+      label: Area
+      description: Select the main area for this hardening suggestion.
+      options:
+        - Apple account authentication
+        - Keychain-stored credentials
+        - Provisioning APIs
+        - Code signing
+        - URL scheme IPA installation
+        - Background signing daemon
+        - Logging or diagnostics
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Hardening suggestion
+      description: Describe the non-sensitive improvement being suggested.
+    validations:
+      required: true
+
+  - type: textarea
+    id: rationale
+    attributes:
+      label: Rationale
+      description: Explain why this would improve the project's security posture without including exploitable details.
+    validations:
+      required: true
+
+  - type: textarea
+    id: references
+    attributes:
+      label: References
+      description: Link to public documentation, platform guidance, or related non-sensitive material.
+    validations:
+      required: false
+
