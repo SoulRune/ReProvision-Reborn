@@ -26,7 +26,13 @@
 
 @end
 
+static BOOL (^_rpvDaemonFileCopyHandler)(NSString *srcPath, NSString *dstPath) = nil;
+
 @implementation RPVIpaBundleApplication
+
++ (void)setDaemonFileCopyHandler:(BOOL (^)(NSString *srcPath, NSString *dstPath))handler {
+    _rpvDaemonFileCopyHandler = [handler copy];
+}
 
 - (instancetype)initWithIpaURL:(NSURL *)url {
     self = [super init];
@@ -87,6 +93,18 @@
         if (data) {
             ok = [data writeToFile:dest options:NSDataWritingAtomic error:&err];
         }
+    }
+
+    // Final fallback: a file vended by another app's / provider's File Provider often can't
+    // be read by this no-container app at all - the picker's security-scoped URL grants no
+    // real access without a container to extend. Hand the raw path to the root daemon,
+    // which can read any on-disk path and writes the copy into destDir (created above, and
+    // which we can read back). Covers browser Downloads, other apps' "On My iPhone" folders
+    // and iCloud: the picker downloads (materialises) an iCloud item as part of selection,
+    // before our delegate fires, so the path we hand the daemon points at the real,
+    // downloaded file - not the .icloud stub - even for items that weren't downloaded yet.
+    if (!ok && _rpvDaemonFileCopyHandler && [url isFileURL] && [url path].length > 0) {
+        ok = _rpvDaemonFileCopyHandler([url path], dest);
     }
 
     if (scoped) [url stopAccessingSecurityScopedResource];

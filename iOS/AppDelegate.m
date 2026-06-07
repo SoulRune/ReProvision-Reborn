@@ -87,6 +87,38 @@ static BOOL RPVIsInstalledViaDpkg(void) {
     // Register for background signing notifications.
     [self _setupDameonConnection];
 
+    // Let shared code (the .ipa importer) read picker files this no-container app can't
+    // read itself, by routing the copy through the root daemon over the existing XPC
+    // connection. Reads self.daemonConnection lazily so reconnects are picked up.
+    __weak AppDelegate *weakDaemonSelf = self;
+    [RPVIpaBundleApplication setDaemonFileCopyHandler:^BOOL(NSString *srcPath, NSString *dstPath) {
+        AppDelegate *strongSelf = weakDaemonSelf;
+        if (!strongSelf || !strongSelf.daemonConnection) return NO;
+
+        __block BOOL result = NO;
+        dispatch_semaphore_t sema = dispatch_semaphore_create(0);
+        @try {
+            [[strongSelf.daemonConnection remoteObjectProxyWithErrorHandler:^(NSError *error) {
+                NSLog(@"*** [ReProvision] :: daemon file-copy proxy error: %@", error);
+                dispatch_semaphore_signal(sema);
+            }] copyFileAtPath:srcPath toPath:dstPath withReply:^(BOOL success) {
+                result = success;
+                dispatch_semaphore_signal(sema);
+            }];
+        } @catch (NSException *e) {
+            NSLog(@"*** [ReProvision] :: daemon file-copy exception: %@", e);
+            return NO;
+        }
+
+        // The picker import runs on a background queue, so blocking is fine there. The
+        // "Open in" path runs on the main thread, but it only reaches this fallback when
+        // the file is otherwise unreadable, and a local root-side copy returns near-
+        // instantly; the errorHandler also signals promptly if the daemon is down. The
+        // long timeout is just a safety cap that should never actually be hit.
+        dispatch_semaphore_wait(sema, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(120 * NSEC_PER_SEC)));
+        return result;
+    }];
+
     // Ensure Chinese devices have internet access
     [self setupChinaApplicationNetworkAccess];
 
@@ -215,11 +247,31 @@ static BOOL RPVIsInstalledViaDpkg(void) {
     return YES;
 }
 
+// Remove a hand-off copy left in the shared App Group Inbox by the share extension.
+// Only touches files inside that container, so direct "Open in" URLs are left alone.
+- (void)_cleanupSharedInboxItemAtURL:(NSURL *)url {
+    if (![url isFileURL]) return;
+
+    NSURL *container = [[NSFileManager defaultManager] containerURLForSecurityApplicationGroupIdentifier:@"group.jp.soh.reprovision.ios"];
+    if (!container) return;
+
+    NSString *inboxPath = [[container URLByAppendingPathComponent:@"Inbox" isDirectory:YES] path];
+    if (![[url path] hasPrefix:inboxPath]) return;
+
+    // Each share is namespaced into its own UUID directory; remove the whole thing.
+    [[NSFileManager defaultManager] removeItemAtURL:[url URLByDeletingLastPathComponent] error:nil];
+}
+
 - (void)_showApplicationDetailControllerFromFileURL:(NSURL *)url {
     dispatch_async(dispatch_get_main_queue(), ^{
         // Create an RPVApplication for this incoming .ipa, and display the installation popup.
 
         RPVIpaBundleApplication *ipaApplication = [[RPVIpaBundleApplication alloc] initWithIpaURL:url];
+
+        // initWithIpaURL: has already copied the .ipa into the app's own tmp dir, so the
+        // share extension's hand-off copy in the shared App Group Inbox is no longer
+        // needed. Clean it up so it doesn't accumulate across shares.
+        [self _cleanupSharedInboxItemAtURL:url];
 
         // If parsing failed there's no bundle id/name/icon. Show an error instead of
         // an empty popup that crashes on install.

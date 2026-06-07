@@ -24,6 +24,10 @@
 
 #import "RPVIpaBundleApplication.h"
 
+#if __has_include(<UniformTypeIdentifiers/UniformTypeIdentifiers.h>)
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#endif
+
 #if TARGET_OS_TV
 #import "RPVStickyScrollView.h"
 #else
@@ -1156,7 +1160,37 @@
 //////////////////////////////////////////////////////////////////////////////////
 
 - (void)installButtonTapped {
-    UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"public.data"] inMode:UIDocumentPickerModeImport];
+    UIDocumentPickerViewController *picker = nil;
+
+#if __has_include(<UniformTypeIdentifiers/UniformTypeIdentifiers.h>)
+    if (@available(iOS 14.0, tvOS 14.0, *)) {
+        // Restrict the picker to .ipa files only - everything else is greyed out. We add
+        // both the canonical system type for the "ipa" extension and our own exported UTI
+        // so a provider that tags the file with either still leaves it selectable.
+        NSMutableArray<UTType *> *types = [NSMutableArray array];
+        UTType *ipaType = [UTType typeWithFilenameExtension:@"ipa"];
+        if (ipaType) [types addObject:ipaType];
+        UTType *exportedIpaType = [UTType typeWithIdentifier:@"jp.soh.reprovision.ipa"];
+        if (exportedIpaType && ![types containsObject:exportedIpaType]) [types addObject:exportedIpaType];
+        // Safety net: if neither resolved, fall back to allowing all items rather than
+        // presenting a picker that can select nothing.
+        if (types.count == 0) [types addObject:UTTypeItem];
+
+        // Open mode (asCopy:NO), NOT copy/import mode. A file vended by a third-party
+        // app's File Provider (e.g. a browser's Downloads folder) is only *selectable*
+        // by tap if the picker's operation is supported by that provider. Many such
+        // providers support "open" but not "import/copy", so in copy mode the tap was
+        // silently ignored (while long-press still worked). Open mode hands us a
+        // security-scoped URL instead; RPVIpaBundleApplication already starts the scoped
+        // access and copies the .ipa into our own tmp dir.
+        picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:types asCopy:NO];
+    }
+#endif
+
+    if (!picker) {
+        picker = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"public.data"] inMode:UIDocumentPickerModeImport];
+    }
+
     picker.delegate = self;
     [self presentViewController:picker animated:YES completion:nil];
 }
@@ -1173,20 +1207,35 @@
 
 - (void)_handlePickedIpaURL:(NSURL *)url {
     if (!url) return;
-    if (![[[url pathExtension] lowercaseString] isEqualToString:@"ipa"]) return;
 
-    // Incoming URL is a fileURL! (RPVIpaBundleApplication handles security-scoped
-    // access and copies it into our own tmp dir.)
+    // Deliberately NOT bailing out on a non-".ipa" path extension here: files vended by a
+    // third-party app's File Provider often arrive with a renamed/extension-less last path
+    // component, and silently returning made tapping them appear to do nothing. Instead we
+    // try to parse, and fall back to a clear error below if it isn't a valid .ipa.
 
+    // Open-mode picker URLs are security-scoped. Start access now, on the delegate
+    // callback, and hold it across the background import so the scope can't lapse while
+    // the picker tears down. (RPVIpaBundleApplication also brackets its own scoped access;
+    // nested start/stop calls are reference-counted, so this is safe.) The copy + unzip is
+    // heavy, so do it off the main thread.
+    BOOL scoped = [url startAccessingSecurityScopedResource];
+
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        [self _processPickedIpaURL:url];
+        if (scoped) [url stopAccessingSecurityScopedResource];
+    });
+}
+
+- (void)_processPickedIpaURL:(NSURL *)url {
     // Create an RPVApplication for this incoming .ipa, and display the installation popup.
     RPVIpaBundleApplication *ipaApplication = [[RPVIpaBundleApplication alloc] initWithIpaURL:url];
 
     // If the .ipa couldn't be parsed there's no bundle id/name/icon: show an error
-    // instead of an empty, un-installable popup.
+    // instead of an empty, un-installable popup (or no reaction at all).
     if ([[ipaApplication bundleIdentifier] length] == 0) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [[RPVNotificationManager sharedInstance] sendNotificationWithTitle:@"Couldn't read IPA"
-                                                                          body:@"Failed to read this .ipa - its Info.plist could not be parsed."
+                                                                          body:@"Failed to read this file as an .ipa - its Info.plist could not be parsed."
                                                                 isDebugMessage:NO
                                                              andNotificationID:nil];
         });

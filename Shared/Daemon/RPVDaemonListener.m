@@ -611,6 +611,40 @@ typedef enum : NSUInteger {
         [self _restartSigningTimerWithInterval:newInterval];
 }
 
+- (void)copyFileAtPath:(NSString *)srcPath toPath:(NSString *)dstPath withReply:(void (^)(BOOL success))reply {
+    NSLog(@"*** [reprovisiond] :: copyFileAtPath recieved: %@ -> %@", srcPath, dstPath);
+
+    if (srcPath.length == 0 || dstPath.length == 0) {
+        reply(NO);
+        return;
+    }
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    // The app normally creates the destination directory in its own tmp before asking,
+    // but make sure it exists regardless.
+    NSString *destDir = [dstPath stringByDeletingLastPathComponent];
+    [fm createDirectoryAtPath:destDir withIntermediateDirectories:YES attributes:nil error:nil];
+
+    // Replace any stale destination from a previous attempt.
+    if ([fm fileExistsAtPath:dstPath]) {
+        [fm removeItemAtPath:dstPath error:nil];
+    }
+
+    NSError *err = nil;
+    BOOL ok = [fm copyItemAtPath:srcPath toPath:dstPath error:&err];
+    if (!ok) {
+        NSLog(@"*** [reprovisiond] :: copyFileAtPath failed: %@", err);
+        reply(NO);
+        return;
+    }
+
+    // root just wrote the file; make sure the (mobile) app can read it back.
+    [fm setAttributes:@{NSFilePosixPermissions : @(0644)} ofItemAtPath:dstPath error:nil];
+
+    reply(YES);
+}
+
 //////////////////////////////////////////////////////////////////////////
 // notify.h stuff
 //////////////////////////////////////////////////////////////////////////
