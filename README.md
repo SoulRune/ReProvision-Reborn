@@ -3,6 +3,13 @@ Re-sign applications on your device.
 
 This project aims at making it easier to (re-)sign iOS and Apple Watch applications on a **jailbroken** iOS device, allowing users to avoid the 7-day limit of free certificates associated with their normal Apple account.
 
+### Maintenance status
+As of 2026, this fork is maintained with a conservative scope. The current focus is iOS support on jailbroken devices, issue triage, security-sensitive review, and compatibility fixes that can be verified by maintainers or contributors. Compatibility should be verified before assuming support for a specific iOS version, device, or jailbreak environment.
+
+tvOS and macOS are not a current maintenance focus for this fork. Changes in those areas may be accepted if they are well-tested, but users should not assume active support for those platforms.
+
+See [MAINTENANCE.md](MAINTENANCE.md) for the current maintenance scope and triage policy.
+
 ### Features
 - Automatic re-signing of locally provisioned applications
 - Basic settings to configure alerts shown when applications are (re-)signed
@@ -15,9 +22,10 @@ Battery optimisations are also in place through the usage of a background daemon
 
 ## URL scheme
 ReProvision Reborn supports URL scheme.
-    ```
-    reprovision://install?url=<IPA URL>
-    ```
+
+```
+reprovision://install?url=<IPA URL>
+```
 
 ## Notes
 [The original project, ReProvision](https://github.com/Matchstic/ReProvision), has been EOL after Apple changed the process of application provisioning on their servers. This fork of ReProvision attempts to maintain the project and get it up-to-date with support for iOS 13 and above, which also explains the rename of the project.
@@ -30,13 +38,18 @@ Attempting to maintain this fork comes at the cost of "dropping" tvOS and macOS 
 Furthermore, while re-distribution of this software is allowed, support for modified versions of this software will not be provided.  
 
 ### Account Handling
-Like most provisioning software, ReProvision supports free and paid development Apple accounts. While crendentials are stored in the device's Keychain for subsequent re-use, they're only sent to Apple's iTunes Connect API for authentication.
+Like most provisioning software, ReProvision supports free and paid development Apple accounts. While credentials are stored in the device's Keychain for subsequent re-use, they're only sent to Apple's iTunes Connect API for authentication.
+
+### Security-sensitive areas
+This project handles several security-sensitive workflows, including Apple account authentication, Keychain-stored credentials, provisioning API calls, code signing, URL scheme IPA installation, and the background signing daemon.
+
+Changes touching these areas should be reviewed carefully and tested against the relevant signing and installation flows. The project does not claim compatibility with untested Apple service changes or platform updates.
 
 ### AltStore vs ReProvision
 This fork of ReProvision uses the same techniques that AltStore uses to tackle provisioning, and by no means should be considered as a competitor.
 
 ### Contributing
-Pull requests, which add a new feature or fix a bug/error, or issue tickets are welcome. Check out the [contributing guidelines](https://github.com/sohsatoh/ReProvision-Reborn/blob/master/CONTRIBUTING.md) for further information.
+Pull requests that add a focused feature, fix a reproducible bug, improve compatibility, or harden security-sensitive behavior are welcome. Check out the [contributing guidelines](CONTRIBUTING.md) for further information.
 
 ## Building
 As long as you have standard libraries for Xcode projects, the only dependencies you need are [CocoaPods](https://github.com/CocoaPods/CocoaPods), [Git](https://git-scm.com/downloads), and [iOSOpenDev](https://github.com/Matchstic/iOSOpenDev.git). You can build the project with 3 simple steps
@@ -45,7 +58,7 @@ As long as you have standard libraries for Xcode projects, the only dependencies
 3. Open ``ReProvision.xcworkspace``, and roll from there
 
 ## License and Third-Party Libraries
-Licensed under the AGPLv3 license. This project occupies specific third-party libraries, which have all been listed (and given credit to) in this [notice](https://raw.githubusercontent.com/sohsatoh/ReProvision/master/iOS/HTML/openSourceLicenses.html).
+Licensed under the AGPLv3 license. This project occupies specific third-party libraries, which have all been listed (and given credit to) in this [notice](https://raw.githubusercontent.com/sohsatoh/ReProvision-Reborn/master/iOS/HTML/openSourceLicenses.html).
 
 The software, ReProvision Reborn (and by extension, ``libReprovision`` as found in ``/Shared/``), and all consecutive copies of the software, are provided without warranty and AS-IS. **This project is NOT intended for piracy.**
 

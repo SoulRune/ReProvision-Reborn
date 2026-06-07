@@ -1,0 +1,9 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Private vulnerability reporting
+    url: https://github.com/sohsatoh/ReProvision-Reborn/security/advisories/new
+    about: Please use GitHub Security Advisories for exploitable vulnerabilities if available. Do not disclose vulnerabilities in public issues.
+  - name: Security policy
+    url: https://github.com/sohsatoh/ReProvision-Reborn/blob/master/SECURITY.md
+    about: Read the security policy before reporting security-sensitive issues.
+
