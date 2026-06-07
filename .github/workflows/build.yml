@@ -1,0 +1,93 @@
+name: Build rootless deb
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          # Pick the newest installed Xcode 16.x whose iphoneos SDK has a matching
+          # simulator runtime on the runner. Forcing plain Xcode_16.app pins SDK 18.0,
+          # whose simulator runtime is usually absent -> ibtool/actool fail with
+          # "iOS 18.0 Platform Not Installed". A later 16.x (e.g. 16.4 = SDK 18.5)
+          # ships a runtime the runner actually has.
+          newest="$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -n1)"
+          if [ -z "$newest" ]; then newest="$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n1)"; fi
+          echo "Selecting $newest"
+          sudo xcode-select -s "$newest"
+          xcodebuild -version
+          echo "Installed iOS simulator runtimes:"
+          xcrun simctl list runtimes || true
+
+      - name: Install build tools
+        run: |
+          brew update
+          brew install ldid dpkg coreutils || true
+          which ldid dpkg-deb
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.2"
+          bundler-cache: false
+
+      - name: Install CocoaPods
+        run: |
+          gem install cocoapods --no-document
+          pod --version
+
+      - name: Pod install
+        run: |
+          pod install --repo-update --verbose
+
+      - name: Build iOS target (unsigned, arm64)
+        env:
+          ARCHS: arm64
+          ONLY_ACTIVE_ARCH: "NO"
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -workspace ReProvision.xcworkspace \
+            -scheme iOS \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            ENABLE_BITCODE=NO \
+            ENABLE_ON_DEMAND_RESOURCES=NO \
+            IPHONEOS_DEPLOYMENT_TARGET=15.0 \
+            build | tee xcodebuild.log
+
+      - name: List produced debs
+        run: |
+          ls -la iOS/CydiaPackages/ || true
+
+      - name: Upload deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: reprovision-rootless-deb
+          path: iOS/CydiaPackages/*.deb
+          if-no-files-found: error
+
+      - name: Upload xcodebuild log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: xcodebuild.log

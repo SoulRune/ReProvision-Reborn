@@ -20,10 +20,13 @@
     [super viewDidLoad];
     // Do any additional setup after loading the view.
     
-    // Remove the titles and adjust the inset to account for missing title
+    // Remove the titles so only the icons show. On iOS 15+ a tab bar item with no
+    // title is already vertically centred by the system, so the old +6pt downward
+    // imageInset (a workaround for iOS 9-14, where the icon stuck to the top) now
+    // over-pushes the icons to the bottom of the bar. Leave the insets at zero.
     for (UITabBarItem * tabBarItem in self.tabBar.items){
         tabBarItem.title = @"";
-        tabBarItem.imageInsets = UIEdgeInsetsMake(6, 0, -6, 0);
+        tabBarItem.imageInsets = UIEdgeInsetsZero;
         tabBarItem.image = [[tabBarItem image] imageWithRenderingMode:UIImageRenderingModeAlwaysOriginal];
     }
 }

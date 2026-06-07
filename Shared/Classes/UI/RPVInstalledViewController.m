@@ -997,12 +997,25 @@
 }
 
 - (void)applicationSigningDidEncounterError:(NSError *)error forBundleIdentifier:(NSString *)bundleIdentifier {
-    [self.currentSigningProgress setObject:@100 forKey:bundleIdentifier];
+    // bundleIdentifier may be nil (e.g. an IPA whose Info.plist failed to parse).
+    // Inserting a nil key into the progress dictionary throws and aborts the app,
+    // so guard it and still surface the underlying error to the user.
+    if ([bundleIdentifier length] > 0) {
+        [self.currentSigningProgress setObject:@100 forKey:bundleIdentifier];
+    }
 
     // Find cell for this identifier.
     // Flash notification on this cell.
     dispatch_async(dispatch_get_main_queue(), ^() {
-        [[self _cellForApplication:[self _applicationForBundleIdentifier:bundleIdentifier]] flashNotificationFailure];
+        if ([bundleIdentifier length] > 0) {
+            [[self _cellForApplication:[self _applicationForBundleIdentifier:bundleIdentifier]] flashNotificationFailure];
+        }
+
+        NSString *message = error.localizedDescription ?: @"Unknown signing error";
+        [[RPVNotificationManager sharedInstance] sendNotificationWithTitle:@"Signing Failed"
+                                                                      body:message
+                                                            isDebugMessage:NO
+                                                         andNotificationID:nil];
     });
 }
 
@@ -1148,31 +1161,60 @@
     [self presentViewController:picker animated:YES completion:nil];
 }
 
+// iOS 11+ calls the plural variant; the singular one below is deprecated and may
+// not fire on iOS 14+, which is why tapping an .ipa appeared to do nothing.
+- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    [self _handlePickedIpaURL:[urls firstObject]];
+}
+
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentAtURL:(NSURL *)url {
+    [self _handlePickedIpaURL:url];
+}
+
+- (void)_handlePickedIpaURL:(NSURL *)url {
+    if (!url) return;
     if (![[[url pathExtension] lowercaseString] isEqualToString:@"ipa"]) return;
 
-    // Incoming URL is a fileURL!
+    // Incoming URL is a fileURL! (RPVIpaBundleApplication handles security-scoped
+    // access and copies it into our own tmp dir.)
 
     // Create an RPVApplication for this incoming .ipa, and display the installation popup.
     RPVIpaBundleApplication *ipaApplication = [[RPVIpaBundleApplication alloc] initWithIpaURL:url];
 
-    RPVApplicationDetailController *detailController = [[RPVApplicationDetailController alloc] initWithApplication:ipaApplication];
+    // If the .ipa couldn't be parsed there's no bundle id/name/icon: show an error
+    // instead of an empty, un-installable popup.
+    if ([[ipaApplication bundleIdentifier] length] == 0) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[RPVNotificationManager sharedInstance] sendNotificationWithTitle:@"Couldn't read IPA"
+                                                                          body:@"Failed to read this .ipa - its Info.plist could not be parsed."
+                                                                isDebugMessage:NO
+                                                             andNotificationID:nil];
+        });
+        return;
+    }
 
-    // Update with current states.
-    [detailController setButtonTitle:@"INSTALL"];
-    detailController.lockWhenInstalling = YES;
+    // Presentation must happen on the main thread, and asynchronously: this is
+    // invoked from the document picker's delegate callback while the picker is
+    // still being dismissed, so presenting synchronously silently does nothing.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        RPVApplicationDetailController *detailController = [[RPVApplicationDetailController alloc] initWithApplication:ipaApplication];
 
-    // Add to the rootViewController of the application, as an effective overlay.
-    detailController.view.alpha = 0.0;
+        // Update with current states.
+        [detailController setButtonTitle:@"INSTALL"];
+        detailController.lockWhenInstalling = YES;
 
-    UIViewController *rootController = [UIApplication sharedApplication].keyWindow.rootViewController;
-    [rootController addChildViewController:detailController];
-    [rootController.view addSubview:detailController.view];
+        // Add to the rootViewController of the application, as an effective overlay.
+        detailController.view.alpha = 0.0;
 
-    detailController.view.frame = rootController.view.bounds;
+        UIViewController *rootController = [UIApplication sharedApplication].keyWindow.rootViewController;
+        [rootController addChildViewController:detailController];
+        [rootController.view addSubview:detailController.view];
 
-    // Animate in!
-    [detailController animateForPresentation];
+        detailController.view.frame = rootController.view.bounds;
+
+        // Animate in!
+        [detailController animateForPresentation];
+    });
 }
 
 @end

@@ -47,6 +47,9 @@
 #include <openssl/pem.h>
 #include <openssl/cms.h>
 #include <openssl/pkcs12.h>
+#include <openssl/asn1t.h>
+#include <openssl/x509.h>
+#include <openssl/objects.h>
 #endif
 
 #ifdef __APPLE__
@@ -1026,6 +1029,86 @@ struct EntitlementsSuperBlob
     }
 };
 
+// Correct DER (ASN.1) encoder for entitlements, required by iOS 15+. Matches the
+// output of modern ldid/codesign: boolean=0x01, integer=0x02, data=0x04 (OCTET
+// STRING), string=0x0c (UTF8String), array=0x30 (SEQUENCE), dictionary=0x31 (SET)
+// of 0x30 SEQUENCE{ UTF8String key, value }. Lengths use proper DER long-form
+// encoding - the previous hand-rolled encoder used a single byte, which produced
+// invalid DER for any length > 127 and a broken length field, so iOS 15+ rejected
+// the signature ("failed to verify code signature", 0xe8008001).
+static void RPVDerPutLength(std::string &out, size_t length) {
+    if (length < 0x80) {
+        out.push_back((char)(uint8_t)length);
+    } else {
+        uint8_t buf[8];
+        int n = 0;
+        size_t v = length;
+        while (v > 0) { buf[n++] = (uint8_t)(v & 0xff); v >>= 8; }
+        out.push_back((char)(uint8_t)(0x80 | n));
+        for (int i = n - 1; i >= 0; --i) out.push_back((char)buf[i]);
+    }
+}
+
+static std::string RPVDerTLV(uint8_t tag, const std::string &value) {
+    std::string out;
+    out.push_back((char)tag);
+    RPVDerPutLength(out, value.size());
+    out.append(value);
+    return out;
+}
+
+static std::string RPVDerFromPlist(plist_t node) {
+    switch (plist_get_node_type(node)) {
+        case PLIST_BOOLEAN: {
+            uint8_t b = 0; plist_get_bool_val(node, &b);
+            return RPVDerTLV(0x01, std::string(1, (char)(b ? 0x01 : 0x00)));
+        }
+        case PLIST_UINT: {
+            uint64_t u = 0; plist_get_uint_val(node, &u);
+            uint8_t buf[8]; int m = 0; uint64_t v = u;
+            if (v == 0) { buf[m++] = 0; }
+            else { while (v > 0) { buf[m++] = (uint8_t)(v & 0xff); v >>= 8; } }
+            std::string val;
+            if (buf[m - 1] & 0x80) val.push_back((char)0x00); // keep INTEGER positive
+            for (int i = m - 1; i >= 0; --i) val.push_back((char)buf[i]);
+            return RPVDerTLV(0x02, val);
+        }
+        case PLIST_STRING: {
+            char *s = NULL; plist_get_string_val(node, &s);
+            std::string val(s ? s : ""); if (s) free(s);
+            return RPVDerTLV(0x0c, val);
+        }
+        case PLIST_DATA: {
+            char *d = NULL; uint64_t len = 0; plist_get_data_val(node, &d, &len);
+            std::string val(d ? d : "", (size_t)len); if (d) free(d);
+            return RPVDerTLV(0x04, val);
+        }
+        case PLIST_ARRAY: {
+            std::string inner;
+            uint32_t n = plist_array_get_size(node);
+            for (uint32_t i = 0; i < n; ++i) inner += RPVDerFromPlist(plist_array_get_item(node, i));
+            return RPVDerTLV(0x30, inner);
+        }
+        case PLIST_DICT: {
+            std::string inner;
+            plist_dict_iter it = NULL; plist_dict_new_iter(node, &it);
+            char *key = NULL; plist_t val = NULL;
+            plist_dict_next_item(node, it, &key, &val);
+            while (val) {
+                std::string entry = RPVDerTLV(0x0c, std::string(key ? key : ""));
+                entry += RPVDerFromPlist(val);
+                inner += RPVDerTLV(0x30, entry);
+                if (key) { free(key); key = NULL; }
+                plist_dict_next_item(node, it, &key, &val);
+            }
+            free(it);
+            return RPVDerTLV(0x31, inner);
+        }
+        default:
+            return std::string();
+    }
+}
+
 struct CodeDirectory {
     uint32_t version;
     uint32_t flags;
@@ -1055,10 +1138,12 @@ extern "C" uint32_t hash(uint8_t *k, uint32_t length, uint32_t initval);
 struct Algorithm {
     size_t size_;
     uint8_t type_;
+    int nid_;
 
-    Algorithm(size_t size, uint8_t type) :
+    Algorithm(size_t size, uint8_t type, int nid = 0) :
         size_(size),
-        type_(type)
+        type_(type),
+        nid_(nid)
     {
     }
 
@@ -1073,7 +1158,7 @@ struct AlgorithmSHA1 :
     Algorithm
 {
     AlgorithmSHA1() :
-        Algorithm(LDID_SHA1_DIGEST_LENGTH, CS_HASHTYPE_SHA160_160)
+        Algorithm(LDID_SHA1_DIGEST_LENGTH, CS_HASHTYPE_SHA160_160, NID_sha1)
     {
     }
 
@@ -1099,7 +1184,7 @@ struct AlgorithmSHA256 :
     Algorithm
 {
     AlgorithmSHA256() :
-        Algorithm(LDID_SHA256_DIGEST_LENGTH, CS_HASHTYPE_SHA256_256)
+        Algorithm(LDID_SHA256_DIGEST_LENGTH, CS_HASHTYPE_SHA256_256, NID_sha256)
     {
     }
 
@@ -1630,23 +1715,109 @@ class Stuff {
     }
 };
 
+// Custom ASN.1 types for the Apple "cdhashes" code-signing attribute (OID
+// 1.2.840.113635.100.9.2). iOS 15+ requires this signed attribute so the OS can
+// authenticate the SHA-256 CodeDirectory; the old ldid never emitted it, which is
+// why install/launch failed with 0xe8008001. Mirrors modern ldid.
+typedef struct {
+    ASN1_OBJECT *algorithm;
+    ASN1_OCTET_STRING *value;
+} APPLE_CDHASH;
+
+DECLARE_ASN1_FUNCTIONS(APPLE_CDHASH)
+
+ASN1_NDEF_SEQUENCE(APPLE_CDHASH) = {
+    ASN1_SIMPLE(APPLE_CDHASH, algorithm, ASN1_OBJECT),
+    ASN1_SIMPLE(APPLE_CDHASH, value, ASN1_OCTET_STRING),
+} ASN1_NDEF_SEQUENCE_END(APPLE_CDHASH)
+
+IMPLEMENT_ASN1_FUNCTIONS(APPLE_CDHASH)
+
+typedef struct {
+    ASN1_OBJECT *object;
+    STACK_OF(APPLE_CDHASH) *cdhashes;
+} APPLE_CDATTR;
+
+DECLARE_ASN1_FUNCTIONS(APPLE_CDATTR)
+
+ASN1_NDEF_SEQUENCE(APPLE_CDATTR) = {
+    ASN1_SIMPLE(APPLE_CDATTR, object, ASN1_OBJECT),
+    ASN1_SET_OF(APPLE_CDATTR, cdhashes, APPLE_CDHASH),
+} ASN1_NDEF_SEQUENCE_END(APPLE_CDATTR)
+
+IMPLEMENT_ASN1_FUNCTIONS(APPLE_CDATTR)
+
+// Build the cdhashes (9.2) attribute from both CodeDirectory hashes and attach it
+// to the given CMS signer's signed attributes.
+static void RPVAddCdHashesAttribute(CMS_SignerInfo *si, const ldid::Hash &hash) {
+    if (si == NULL) return;
+
+    APPLE_CDATTR *cdattr = APPLE_CDATTR_new();
+    if (cdattr == NULL) return;
+
+    static int nid = OBJ_create("1.2.840.113635.100.9.2", "apple-2", "Apple 2");
+    cdattr->object = OBJ_nid2obj(nid);
+
+    for (Algorithm *pointer : GetAlgorithms()) {
+        Algorithm &algorithm(*pointer);
+        APPLE_CDHASH *cdhash = APPLE_CDHASH_new();
+        if (cdhash == NULL) continue;
+        sk_push((_STACK *) cdattr->cdhashes, cdhash);
+        cdhash->algorithm = OBJ_nid2obj(algorithm.nid_);
+        ASN1_OCTET_STRING_set(cdhash->value, algorithm[hash], (int) algorithm.size_);
+    }
+
+    // Re-serialize as a generic X509_ATTRIBUTE (matches modern ldid's approach to
+    // avoid OpenSSL version quirks in X509_ATTRIBUTE_set1_data).
+    ASN1_STRING *seq = ASN1_STRING_new();
+    if (seq != NULL) {
+        seq->length = ASN1_item_i2d((ASN1_VALUE *) cdattr, &seq->data, ASN1_ITEM_rptr(APPLE_CDATTR));
+        const unsigned char *data = seq->data;
+        X509_ATTRIBUTE *attribute = NULL;
+        if (d2i_X509_ATTRIBUTE(&attribute, &data, seq->length) != NULL && attribute != NULL) {
+            CMS_signed_add1_attr(si, attribute);
+            X509_ATTRIBUTE_free(attribute);
+        }
+        ASN1_STRING_free(seq);
+    }
+
+    APPLE_CDATTR_free(cdattr);
+}
+
 class Signature {
   private:
     CMS_ContentInfo *value_;
 
   public:
-    Signature(const Stuff &stuff, const Buffer &data)
+    Signature(const Stuff &stuff, const Buffer &data, const ldid::Hash &hash)
     {
         int flags = CMS_PARTIAL | CMS_DETACHED | CMS_NOSMIMECAP | CMS_BINARY;
-        
+
         CMS_ContentInfo *stream = CMS_sign(NULL, NULL, stuff, NULL, flags);
-        
+
         // iOS 12 requires both SHA1 and SHA256 signing digests.
-        CMS_add1_signer(stream, stuff, stuff, EVP_sha256(), flags);
-        CMS_add1_signer(stream, stuff, stuff, EVP_sha1(), flags);
-        
+        CMS_SignerInfo *signer256 = CMS_add1_signer(stream, stuff, stuff, EVP_sha256(), flags);
+        CMS_SignerInfo *signer1 = CMS_add1_signer(stream, stuff, stuff, EVP_sha1(), flags);
+
+        // iOS 15+ requires the cdhashes (1.2.840.113635.100.9.2) signed attribute so
+        // the OS can authenticate the SHA-256 CodeDirectory. Attach it to each signer.
+        RPVAddCdHashesAttribute(signer256, hash);
+        RPVAddCdHashesAttribute(signer1, hash);
+
+        // iOS 15+ requires the full certificate chain to be embedded in the CMS so
+        // the signature can be verified (leaf developer cert + Apple WWDR intermediate
+        // + Apple Root CA). Without the intermediate, installd/AMFI reject the binary
+        // with 0xe8008001 ("failed to verify code signature"). The CMS_sign + add1_signer
+        // path above was leaving the chain incomplete, so add every certificate
+        // explicitly (CMS_add1_cert is a no-op if a cert is already present).
+        CMS_add1_cert(stream, (X509 *)stuff);                       // leaf signing cert
+        if (STACK_OF(X509) *chain = (STACK_OF(X509) *)stuff) {
+            for (int i = 0; i < sk_X509_num(chain); i++)
+                CMS_add1_cert(stream, sk_X509_value(chain, i));     // WWDR intermediate + root
+        }
+
         CMS_final(stream, data, NULL, flags);
-        
+
         value_ = stream;
         _assert(value_ != NULL);
     }
@@ -1903,90 +2074,24 @@ Hash Sign(const void *idata, size_t isize, std::streambuf &output, const std::st
         
         if (!entitlements.empty())
         {
-            std::vector<EntitlementBlob> entitlementBlobs;
-            
             plist_t plist = NULL;
             plist_from_xml(entitlements.data(), (uint32_t)entitlements.length(), &plist);
-            
-            plist_dict_iter it = NULL;
-            plist_dict_new_iter(plist, &it);
-            
-            char *key = NULL;
-            plist_t node = NULL;
-            plist_dict_next_item(plist, it, &key, &node);
-            
-            while (node)
+
+            if (plist != NULL)
             {
-                plist_type type = plist_get_node_type(node);
-                switch (type)
-                {
-                    case PLIST_STRING:
-                    {
-                        char *value = NULL;
-                        plist_get_string_val(node, &value);
-                        
-                        EntitlementBlob blob(key, std::string(value)); // Explicitly cast value to std::string or else it will (annoyingly) call bool constructor.
-                        entitlementBlobs.push_back(blob);
-                        
-                        free(value);
-                        
-                        break;
-                    }
-                        
-                    case PLIST_BOOLEAN:
-                    {
-                        uint8_t value = 0;
-                        plist_get_bool_val(node, &value);
-                        
-                        EntitlementBlob blob(key, value != 0);
-                        entitlementBlobs.push_back(blob);
-                        break;
-                    }
-                        
-                    case PLIST_ARRAY:
-                    {
-                        std::vector<std::string> values;
-                        
-                        int size = plist_array_get_size(node);
-                        for (int i = 0; i < size; i++)
-                        {
-                            plist_t subnode = plist_array_get_item(node, i);
-                            
-                            char *value = NULL;
-                            plist_get_string_val(subnode, &value);
-                            
-                            values.push_back(value);
-                            
-                            free(value);
-                        }
-                        
-                        EntitlementBlob blob(key, values);
-                        entitlementBlobs.push_back(blob);
-                        break;
-                    }
-                        
-                    default:
-                    {
-                        printf("[ldid] Unsupported entitlement type: %d\n", type);
-                        break;
-                    }
-                }
-                
-                free(key);
-                key = NULL;
-                
-                plist_dict_next_item(plist, it, &key, &node);
+                std::string derContent = RPVDerFromPlist(plist);
+                plist_free(plist);
+
+                // DER entitlements blob: magic (0xfade7172) + total length + DER bytes.
+                std::stringbuf data;
+                uint32_t magic = Swap((uint32_t)CSMAGIC_EMBEDDED_RAW_ENTITLEMENTS);
+                uint32_t length = Swap((uint32_t)(derContent.size() + 8));
+                put(data, (char *)&magic, 4);
+                put(data, (char *)&length, 4);
+                put(data, derContent.data(), derContent.size());
+
+                insert(blobs, CSSLOT_RAW_ENTITLEMENTS, data);
             }
-            
-            free(it);
-            plist_free(plist);
-
-            std::stringbuf data;
-
-            EntitlementsSuperBlob superBlob(entitlementBlobs);
-            put(data, superBlob.data().data(), superBlob.length);
-
-            insert(blobs, CSSLOT_RAW_ENTITLEMENTS, data);
         }
 
         Slots posts(slots);
@@ -2091,7 +2196,7 @@ Hash Sign(const void *idata, size_t isize, std::streambuf &output, const std::st
             Stuff stuff(key);
             Buffer bio(sign);
 
-            Signature signature(stuff, sign);
+            Signature signature(stuff, sign, hash);
             Buffer result(signature);
             std::string value(result);
             put(data, value.data(), value.size());
@@ -2543,9 +2648,12 @@ Bundle Sign(const std::string &root, Folder &folder, const std::string &key, std
         bundle.resize(bundle.size() - resources.size());
         SubFolder subfolder(folder, bundle);
 
-        bundles[nested[1]] = Sign(bundle, subfolder, key, local, "", Starts(name, "PlugIns/") ? alter :
-            static_cast<const Functor<std::string (const std::string &, const std::string &)> &>(fun([&](const std::string &, const std::string &entitlements) -> std::string { return entitlements; }))
-        , progress, percent);
+        // Run EVERY nested bundle (Frameworks too, not just PlugIns) through the
+        // caller's alter callback. ldid originally passed framework entitlements
+        // through unchanged, but that keeps disallowed (private/jailbreak/iCloud)
+        // entitlements from repackaged IPAs, which makes installd reject the whole app
+        // (0xe8008001). Our alter strips anything the free profile doesn't grant.
+        bundles[nested[1]] = Sign(bundle, subfolder, key, local, "", alter, progress, percent);
     }), fun([&](const std::string &name, const Functor<std::string ()> &read) {
     }));
 

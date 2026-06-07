@@ -11,10 +11,10 @@
     </dict>
     <key>ProgramArguments</key>
     <array>
-      <string>/usr/bin/env</string>
+      <string>/var/jb/usr/bin/env</string>
       <string>_MSSafeMode=1</string>
       <string>_SafeMode=1</string>
-      <string>/usr/libexec/reprovisiond</string>
+      <string>/var/jb/usr/libexec/reprovisiond</string>
     </array>
     <key>UserName</key>
     <string>root</string>
@@ -22,5 +22,7 @@
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>POSIXSpawnType</key>
+    <string>Interactive</string>
   </dict>
 </plist>

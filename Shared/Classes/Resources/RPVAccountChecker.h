@@ -26,4 +26,6 @@
 
 - (void)listAllApplicationsWithCompletionHandler:(void (^)(NSError*, NSArray *))completionHandler;
 
+- (NSString*)UDIDForCurrentDevice;
+
 @end

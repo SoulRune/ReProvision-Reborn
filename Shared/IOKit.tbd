@@ -1,12 +1,10 @@
---- !tapi-tbd-v3
-archs:           [ armv7, armv7s, arm64, arm64e ]
-uuids:           [ 'armv7: BD23F5CF-3083-3A2E-B16C-64D805C9879A', 'armv7s: 130B8EED-1C40-3BCC-9E39-D150FF05728D', 
-                   'arm64: 26F21069-E729-30D1-A9A4-830F750CCAB7', 'arm64e: 0A42C8B1-079A-3AB2-91D5-4AFE6965A7C6' ]
-platform:        ios
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ arm64-ios, arm64e-ios ]
 install-name:    '/System/Library/Frameworks/IOKit.framework/Versions/A/IOKit'
 current-version: 275
 exports:         
-  - archs:           [ armv7, armv7s ]
+  - targets:         [ arm64-ios, arm64e-ios ]
     symbols:         [ _IOAVAudioFormatTypeString, _IOAVAudioSampleRate, _IOAVAudioSampleSize, 
                        _IOAVDeviceGetProtectionType, _IOAVGetSupportedVideoTimingDataList, 
                        _IOAVGetTransportSupportsCEA, _IOAVGetTransportSupportsYCbCr, 
@@ -59,9 +57,9 @@ exports:
                        _io_service_request_probe, _io_service_set_authorization_id, 
                        _io_service_wait_quiet, _kIOHIDServiceEnumerationRootQueue, 
                        _kIOHIDServiceInterruptRootQueue ]
-  - archs:           [ arm64, arm64e ]
+  - targets:         [ arm64-ios, arm64e-ios ]
     symbols:         [ __ZN9DisplayID8checksumEPKvm ]
-  - archs:           [ armv7, armv7s, arm64, arm64e ]
+  - targets:         [ arm64-ios, arm64e-ios ]
     symbols:         [ _IOAVAudioFormatString, _IOAVAudioGetChannelAllocation, _IOAVAudioGetChannelAllocationDefault, 
                        _IOAVAudioGetChannelLayoutData, _IOAVAudioGetSpeakerAllocationMask, 
                        _IOAVAudioInterfaceCopyChannelLayoutElements, _IOAVAudioInterfaceCopyDiagnosticsString, 

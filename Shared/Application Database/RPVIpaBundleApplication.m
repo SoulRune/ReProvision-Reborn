@@ -32,15 +32,71 @@
     self = [super init];
 
     if (self) {
-        // Initialise by pre-loading information from the .ipa file.
-        self.cachedInfoPlist = [self _loadInfoPlistFromURL:url];
-        self.cachedIconImage = [self _loadApplicationIconFromURL:url withInfoPlist:self.cachedInfoPlist];
-        self.uncompressedSize = [self _loadUncompressedFileSizeFromURL:url];
+        // URLs handed to us from the Files app / "Open in" / document picker are
+        // security-scoped: they can't be read without startAccessingSecurityScopedResource,
+        // and the scope is only valid briefly. Copy the .ipa into our own tmp dir up
+        // front so every later read (Info.plist parse here, and the unzip during the
+        // actual signing) works regardless of the source. Without this the Info.plist
+        // comes back empty -> nil bundleIdentifier/name/icon and a crash on install.
+        NSURL *localURL = [self _importToLocalCopy:url];
+        if (!localURL) localURL = url;
 
-        self.cachedURL = url;
+        // Initialise by pre-loading information from the .ipa file.
+        self.cachedInfoPlist = [self _loadInfoPlistFromURL:localURL];
+        self.cachedIconImage = [self _loadApplicationIconFromURL:localURL withInfoPlist:self.cachedInfoPlist];
+        self.uncompressedSize = [self _loadUncompressedFileSizeFromURL:localURL];
+
+        self.cachedURL = localURL;
     }
 
     return self;
+}
+
+- (NSURL *)_importToLocalCopy:(NSURL *)url {
+    if (!url) return nil;
+
+    BOOL scoped = [url startAccessingSecurityScopedResource];
+
+    NSString *tmp = NSTemporaryDirectory();
+    if (!tmp) tmp = @"/tmp";
+
+    // Namespace the copy so concurrent imports don't clash, but keep the original
+    // filename so the .ipa extension (checked downstream) is preserved.
+    NSString *destDir = [tmp stringByAppendingPathComponent:[[NSUUID UUID] UUIDString]];
+    [[NSFileManager defaultManager] createDirectoryAtPath:destDir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *dest = [destDir stringByAppendingPathComponent:[url lastPathComponent]];
+
+    NSError *err = nil;
+    BOOL ok = [[NSFileManager defaultManager] copyItemAtURL:url toURL:[NSURL fileURLWithPath:dest] error:&err];
+
+    // copyItemAtURL: can fail for files handed over by other processes (e.g. the
+    // share extension's container). Fall back to a coordinated NSData read+write,
+    // which works when we have broad file access but the path-level copy is denied.
+    if (!ok) {
+        NSError *readErr = nil;
+        NSData *data = [NSData dataWithContentsOfURL:url options:0 error:&readErr];
+        if (!data) {
+            NSError *coordErr = nil;
+            NSFileCoordinator *coordinator = [[NSFileCoordinator alloc] initWithFilePresenter:nil];
+            __block NSData *coordinated = nil;
+            [coordinator coordinateReadingItemAtURL:url options:NSFileCoordinatorReadingWithoutChanges error:&coordErr byAccessor:^(NSURL *newURL) {
+                coordinated = [NSData dataWithContentsOfURL:newURL options:0 error:nil];
+            }];
+            data = coordinated;
+        }
+        if (data) {
+            ok = [data writeToFile:dest options:NSDataWritingAtomic error:&err];
+        }
+    }
+
+    if (scoped) [url stopAccessingSecurityScopedResource];
+
+    if (!ok) {
+        NSLog(@"*** [ReProvision] :: failed to import IPA to local copy: %@", err);
+        return nil;
+    }
+
+    return [NSURL fileURLWithPath:dest];
 }
 
 - (NSNumber *)_loadUncompressedFileSizeFromURL:(NSURL *)url {

@@ -95,24 +95,38 @@
     if (![[NSFileManager defaultManager] fileExistsAtPath:appProvisioningPath]) return NO;
 
     NSDictionary *appProvisioningFile = [RPVApplication provisioningProfileAtPath:appProvisioningPath];
-    if (!appProvisioningFile) return NO;
+    if (![appProvisioningFile isKindOfClass:[NSDictionary class]] || appProvisioningFile.count == 0) return NO;
 
-    // Check if the same provisioning file exists in "/var/MobileDevice/ProvisioningProfiles".
+    // Historically we cross-checked the embedded profile against the system store at
+    // /var/MobileDevice/ProvisioningProfiles to make sure it is still installed.
+    // On iOS 15+/rootless that directory typically can't be enumerated from here, so
+    // the strict isEqualToDictionary check failed for EVERY app and made even
+    // perfectly valid apps report as "expired". Match by the profile UUID when we can
+    // read the store, and otherwise trust the app's own embedded profile.
     NSString *profilesFolderPath = @"/var/MobileDevice/ProvisioningProfiles";
     NSFileManager *fileManager = [[NSFileManager alloc] init];
-    NSDirectoryEnumerator *dirEnum = [fileManager enumeratorAtPath:profilesFolderPath];
+    NSArray *contents = [fileManager contentsOfDirectoryAtPath:profilesFolderPath error:nil];
 
-    NSString *filePath;
-    while ((filePath = [dirEnum nextObject])) {
-        filePath = [NSString stringWithFormat:@"%@/%@", profilesFolderPath, filePath];
-        NSDictionary *provisioningProfile = [RPVApplication provisioningProfileAtPath:filePath];
-        if (provisioningProfile) {
-            // Check if two dictionaries are the same
-            if ([appProvisioningFile isEqualToDictionary:provisioningProfile]) return YES;
-        }
+    if (contents.count == 0) {
+        // Can't verify against the system store - trust the embedded profile.
+        return YES;
     }
 
-    return NO;
+    NSString *appUUID = [appProvisioningFile objectForKey:@"UUID"];
+    for (NSString *file in contents) {
+        NSString *filePath = [profilesFolderPath stringByAppendingPathComponent:file];
+        NSDictionary *provisioningProfile = [RPVApplication provisioningProfileAtPath:filePath];
+        if (![provisioningProfile isKindOfClass:[NSDictionary class]]) continue;
+
+        NSString *uuid = [provisioningProfile objectForKey:@"UUID"];
+        if (appUUID.length > 0 && [appUUID isEqualToString:uuid]) return YES;
+        if ([appProvisioningFile isEqualToDictionary:provisioningProfile]) return YES;
+    }
+
+    // We could read the store but found no match. The profile may live elsewhere on
+    // this OS; be lenient and trust the embedded profile's own ExpirationDate rather
+    // than forcing an incorrect "expired" state.
+    return YES;
 }
 
 - (NSDate *)applicationExpiryDate {
@@ -155,7 +169,11 @@
 
 + (NSDictionary *)provisioningProfileAtPath:(NSString *)path {
     NSError *err;
-    NSString *stringContent = [NSString stringWithContentsOfFile:path encoding:NSASCIIStringEncoding error:&err];
+    // A .mobileprovision is a PKCS#7/CMS container with bytes > 127, so reading it as
+    // strict ASCII returns nil and the whole parse silently fails (making every app
+    // look "expired"). ISO Latin-1 maps all 256 byte values and never fails; the
+    // <plist> payload itself is ASCII XML, so extraction stays correct.
+    NSString *stringContent = [NSString stringWithContentsOfFile:path encoding:NSISOLatin1StringEncoding error:&err];
 
     NSString *startMarker = @"<plist";
     NSString *endMarker = @"</plist>";

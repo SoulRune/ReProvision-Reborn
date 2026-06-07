@@ -31,7 +31,12 @@
     <true/>
 
     <key>com.apple.private.MobileGestalt.AllowedProtectedKeys</key>
-    <true/>
+    <array>
+      <string>UniqueDeviceID</string>
+      <string>UniqueChipID</string>
+      <string>SerialNumber</string>
+      <string>InternationalMobileEquipmentIdentity</string>
+    </array>
 
     <key>com.apple.managedconfiguration.profiled-access</key>
     <true/>

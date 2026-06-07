@@ -1,5 +1,8 @@
 #!/bin/bash
 
+JB_PREFIX="/var/jb"
+PLIST="${JB_PREFIX}/Library/LaunchDaemons/jp.soh.reprovisiond.plist"
+
 function finish() {
 	f="${1}"
 
@@ -18,32 +21,38 @@ if [ -d "/var/mobile/Library/Application Support/Containers/jp.soh.reprovision.i
 	rm -rf "/var/mobile/Library/Application Support/Containers/jp.soh.reprovision.ios/Documents/Inbox"
 fi
 
-# Check if old daemon exists
-{
-	if [ -f "/usr/bin/reprovisiond" ]; then
-		echo "Why are you install ReProvision from pirate repo although it is free?"
-		echo "If you don't know the official repository, maybe you don't even know that there is a great service in this world called Google."
-		echo "Uninstall ReProvision first, and then install ReProvision Reborn from official repo."
-		echo "Good bye."
-		exit 1
-	fi
-}
+# Locate launchctl (rootless paths first, then fallbacks)
+LAUNCHCTL=""
+for c in "${JB_PREFIX}/bin/launchctl" "${JB_PREFIX}/usr/bin/launchctl" "/bin/launchctl" "/usr/bin/launchctl"; do
+	if [ -x "$c" ]; then LAUNCHCTL="$c"; break; fi
+done
 
 # Handle the daemon
 echo "(Re)-loading daemon..."
-chown root /Library/LaunchDaemons/jp.soh.reprovisiond.plist
 
-# Unload for an upgrade. - Might spew an error, so hide that.
-/bin/launchctl unload /Library/LaunchDaemons/jp.soh.reprovisiond.plist 2>/dev/null || /sbin/launchctl unload /Library/LaunchDaemons/jp.soh.reprovisiond.plist 2>/dev/null
-/bin/launchctl load /Library/LaunchDaemons/jp.soh.reprovisiond.plist 2>/dev/null || /sbin/launchctl load /Library/LaunchDaemons/jp.soh.reprovisiond.plist
+if [ -f "$PLIST" ]; then
+	chown root:wheel "$PLIST" 2>/dev/null || true
+	chmod 644 "$PLIST" 2>/dev/null || true
+fi
 
-# # Reload application cache (is this still needed?)
+if [ -n "$LAUNCHCTL" ]; then
+	# bootstrap/bootout (modern) with fallback to load/unload (older launchctl)
+	"$LAUNCHCTL" bootout system "$PLIST" >/dev/null 2>&1 || "$LAUNCHCTL" unload "$PLIST" >/dev/null 2>&1 || true
+	"$LAUNCHCTL" bootstrap system "$PLIST" >/dev/null 2>&1 || "$LAUNCHCTL" load "$PLIST" >/dev/null 2>&1 || true
+fi
+
+# Reload application cache via uicache (rootless)
 echo "Reloading application cache"
-uicache -p /Applications/ReProvision.app
+UICACHE=""
+for c in "${JB_PREFIX}/usr/bin/uicache" "${JB_PREFIX}/bin/uicache" "/usr/bin/uicache"; do
+	if [ -x "$c" ]; then UICACHE="$c"; break; fi
+done
+if [ -n "$UICACHE" ]; then
+	"$UICACHE" -p "${JB_PREFIX}/Applications/ReProvision.app" || "$UICACHE" -a || true
+fi
 
 # Classic easter egg
 echo "Do, or do not. There is no try."
 
-# Finally, request Cydia to restart SpringBoard after installation.
-# This is ensure we catch cases where users need to log in after install.
 finish restart
+exit 0

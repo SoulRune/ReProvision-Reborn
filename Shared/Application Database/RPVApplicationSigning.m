@@ -13,6 +13,16 @@
 
 #import "SSZipArchive.h"
 
+#import <dlfcn.h>
+#import <objc/runtime.h>
+
+// MCProfileConnection (ManagedConfiguration) - used to register a provisioning
+// profile with the system so the OS trusts the signed app. Accessed purely via the
+// ObjC runtime so there's no link-time dependency in non-UI targets.
+@interface MCProfileConnection : NSObject
++ (instancetype)sharedConnection;
+@end
+
 /* Private headers */
 @interface LSApplicationWorkspace : NSObject
 + (instancetype)defaultWorkspace;
@@ -274,7 +284,72 @@ static RPVApplicationSigning *sharedInstance;
     }
 }
 
-- (void)_installIpaAtPath:(NSString *)ipaPath withBundleIdentifier:(NSString *)bundleIdentifier {
+// Register the signed app's provisioning profile with the system. On iOS 13/14 the
+// on-device install registered the embedded profile automatically; on iOS 15+/rootless
+// it does not, so the OS has no trusted profile for the app and rejects its signature
+// ("failed to verify code signature" at install / instant AMFI kill at launch, and no
+// entry in Settings > VPN & Device Management). This mirrors what Sideloadly/AltStore
+// do as a separate step. Best-effort + heavily logged so we can confirm the exact API.
+- (BOOL)_registerProvisioningProfileAtPath:(NSString *)profilePath {
+    NSMutableString *report = [NSMutableString string];
+    BOOL success = NO;
+
+    NSData *data = [NSData dataWithContentsOfFile:profilePath];
+    if (data.length == 0) {
+        [report appendFormat:@"no profile data at %@\n", profilePath];
+    } else {
+        dlopen("/System/Library/PrivateFrameworks/ManagedConfiguration.framework/ManagedConfiguration", RTLD_LAZY);
+        Class cls = objc_getClass("MCProfileConnection");
+        id connection = cls ? [cls sharedConnection] : nil;
+
+        if (!cls) {
+            [report appendString:@"MCProfileConnection class unavailable\n"];
+        } else if (!connection) {
+            [report appendString:@"MCProfileConnection sharedConnection was nil\n"];
+        } else {
+            // The real provisioning-profile installer on iOS 15+:
+            //   - (BOOL)installProvisioningProfileData:(NSData *)data
+            //              managingProfileIdentifier:(NSString *)identifier
+            //                               outError:(NSError **)error;
+            SEL sel = NSSelectorFromString(@"installProvisioningProfileData:managingProfileIdentifier:outError:");
+            if ([connection respondsToSelector:sel]) {
+                NSMethodSignature *sig = [connection methodSignatureForSelector:sel];
+                NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                [inv setTarget:connection];
+                [inv setSelector:sel];
+                [inv setArgument:&data atIndex:2];
+                NSString *managing = nil;
+                [inv setArgument:&managing atIndex:3];
+                NSError *__autoreleasing outError = nil;
+                NSError *__autoreleasing *outPtr = &outError;
+                [inv setArgument:&outPtr atIndex:4];
+
+                BOOL ret = NO;
+                @try {
+                    [inv invoke];
+                    if (sig.methodReturnLength == sizeof(BOOL)) [inv getReturnValue:&ret];
+                    success = ret && (outError == nil);
+                    [report appendFormat:@"installProvisioningProfileData:managingProfileIdentifier:outError: returned %d, error: %@\n", ret, outError ?: @"none"];
+                } @catch (NSException *e) {
+                    [report appendFormat:@"install threw %@\n", e];
+                }
+            } else {
+                [report appendString:@"installProvisioningProfileData:managingProfileIdentifier:outError: not available\n"];
+            }
+        }
+    }
+
+    NSLog(@"*** [ReProvision] profile register report:\n%@", report);
+
+    return success;
+}
+
+- (void)_installIpaAtPath:(NSString *)ipaPath withBundleIdentifier:(NSString *)bundleIdentifier displayBundleIdentifier:(NSString *)displayBundleIdentifier {
+    // bundleIdentifier is the *signed* id (with the Team ID suffix) - used for the
+    // actual install/uninstall. displayBundleIdentifier is the id the UI tracks
+    // progress under (the original, pre-signing id), so the progress bar reaches
+    // 100% instead of getting stuck at 60%.
+    if ([displayBundleIdentifier length] == 0) displayBundleIdentifier = bundleIdentifier;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSError *error;
         NSDictionary *options = @{ @"CFBundleIdentifier": bundleIdentifier, @"AllowInstallLocalProvisioned": [NSNumber numberWithBool:YES] };
@@ -305,44 +380,47 @@ static RPVApplicationSigning *sharedInstance;
 
                     // Update progress to 70% for this application.
                     for (id<RPVApplicationSigningProtocol> observer in [self.observers reverseObjectEnumerator]) {
-                        [observer applicationSigningUpdateProgress:75 forBundleIdentifier:bundleIdentifier];
+                        [observer applicationSigningUpdateProgress:75 forBundleIdentifier:displayBundleIdentifier];
                     }
 
                     NSLog(@"*** Uninstalled application, trying again.");
-                    [self _installIpaAtPath:[ipaPath stringByReplacingOccurrencesOfString:@".ipa" withString:@"2.ipa"] withBundleIdentifier:bundleIdentifier];
+                    [self _installIpaAtPath:[ipaPath stringByReplacingOccurrencesOfString:@".ipa" withString:@"2.ipa"] withBundleIdentifier:bundleIdentifier displayBundleIdentifier:displayBundleIdentifier];
 
                     return;
                 }
             }
 
-            // Give an error, but make it user-friendly.
-            NSString *errorMessage = [NSString stringWithFormat:@"%@, (code: %ld)", error.localizedDescription, (long)error.code];
-            if ([errorMessage containsString:@"invalid entitlements"]) {
-                errorMessage = @"Incorrect entitlements for this application. This is likely caused by ReProvision not supporting a capability this application needs.";
-            } else if ([errorMessage containsString:@"valid provisioning profile"]) {
-                errorMessage = @"This application hasn't been signed correctly for this device. This may occur if this device is not registered to the account used to sign with - try logging out then in again";
-            } else if (error.code == 13) {
-                errorMessage = @"This app could not be installed because there already are 3 signed apps installed. Automatic resigning needs at maximum 2 apps installed via your account.";
-            } else {
-                // Parse out the useful information from the error description
-                NSRange range = [error.localizedDescription rangeOfString:@"(" options:NSBackwardsSearch];
+            // Build a full, faithful description of the installd error. The old
+            // code tried to extract a "user friendly" substring (everything after
+            // the last "("), which mangled iOS 16 errors into a useless set fragment
+            // like ("com.foo.bar.TEAMID") and hid the real reason. Keep the friendly
+            // mappings for known cases, but otherwise surface the raw error verbatim.
+            NSString *rawDescription = error.localizedDescription ?: @"Unknown install error";
+            NSString *fullError = [NSString stringWithFormat:@"%@ [%@ %ld]", rawDescription, error.domain ?: @"?", (long)error.code];
 
-                if (range.location != NSNotFound) {
-                    errorMessage = [error.localizedDescription substringFromIndex:range.location];
-                    errorMessage = [errorMessage substringToIndex:errorMessage.length - 2];
-                }
+            // Pull underlying error / recovery details into the message too.
+            NSString *underlying = [[error.userInfo objectForKey:NSUnderlyingErrorKey] localizedDescription];
+            if ([underlying length] > 0) {
+                fullError = [fullError stringByAppendingFormat:@" | underlying: %@", underlying];
             }
+
+            // Show the raw installd error verbatim. (Older code tried to map known
+            // codes to "friendly" text - including a wrong "3 app limit" message for
+            // code 13 - which hid the real reason, so we just surface the truth.)
+            NSString *errorMessage = fullError;
+
+            NSLog(@"*** [ReProvision] install failed: domain=%@ code=%ld desc=%@ userInfo=%@", error.domain, (long)error.code, error.localizedDescription, error.userInfo);
 
             NSError *err = [self _errorFromString:errorMessage errorCode:RPVErrorFailedToInstallSignedIPA];
             for (id<RPVApplicationSigningProtocol> observer in [self.observers reverseObjectEnumerator]) {
-                [observer applicationSigningDidEncounterError:err forBundleIdentifier:bundleIdentifier];
+                [observer applicationSigningDidEncounterError:err forBundleIdentifier:displayBundleIdentifier];
             }
         }
 
         if (result) {
             // Update progress to 90% for this application.
             for (id<RPVApplicationSigningProtocol> observer in [self.observers reverseObjectEnumerator]) {
-                [observer applicationSigningUpdateProgress:90 forBundleIdentifier:bundleIdentifier];
+                [observer applicationSigningUpdateProgress:90 forBundleIdentifier:displayBundleIdentifier];
             }
         }
 
@@ -353,7 +431,7 @@ static RPVApplicationSigning *sharedInstance;
         if (result) {
             // Update progress to 100% for this application.
             for (id<RPVApplicationSigningProtocol> observer in [self.observers reverseObjectEnumerator]) {
-                [observer applicationSigningUpdateProgress:100 forBundleIdentifier:bundleIdentifier];
+                [observer applicationSigningUpdateProgress:100 forBundleIdentifier:displayBundleIdentifier];
             }
         }
 
@@ -504,7 +582,28 @@ static RPVApplicationSigning *sharedInstance;
         // 4. Install IPA
         //////////////////////////////////////////////////////////////////////////////////////
 
+        // libProvision appends the Team ID to the bundle id when signing (e.g.
+        // com.opa334.Dopamine -> com.opa334.Dopamine.C9RTXQNQ3J). installd matches
+        // the IPA against the CFBundleIdentifier install option, so we must pass the
+        // *signed* id, not the original. Read it straight from the repacked app's
+        // Info.plist; fall back to the original only if that read fails.
         NSString *bundleIdentifier = [application bundleIdentifier];
+        NSString *signedInfoPlistPath = [[applicationBundleURL path] stringByAppendingPathComponent:@"Info.plist"];
+        NSDictionary *signedInfoPlist = [NSDictionary dictionaryWithContentsOfFile:signedInfoPlistPath];
+        NSString *signedBundleIdentifier = [signedInfoPlist objectForKey:@"CFBundleIdentifier"];
+        if ([signedBundleIdentifier length] > 0) {
+            bundleIdentifier = signedBundleIdentifier;
+        }
+        NSLog(@"*** [ReProvision] installing with bundle id '%@' (original '%@')", bundleIdentifier, [application bundleIdentifier]);
+
+        // Register the freshly-signed provisioning profile with the system so iOS
+        // trusts the signed app (misagent/MCProfileConnection). Without this the OS
+        // refuses to launch the app even when the signature itself is valid.
+        NSString *embeddedPath = [[applicationBundleURL path] stringByAppendingPathComponent:@"embedded.mobileprovision"];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:embeddedPath]) {
+            BOOL registered = [self _registerProvisioningProfileAtPath:embeddedPath];
+            NSLog(@"*** [ReProvision] provisioning profile registered with system: %d", registered);
+        }
 
         // Start the next application off at this point for some parallelism!
         if (self.installQueue.count > 1) {
@@ -517,8 +616,9 @@ static RPVApplicationSigning *sharedInstance;
             self.undertakingResignPipeline = NO;
         }
 
-        // And now we install!
-        [self _installIpaAtPath:outputIpaPath withBundleIdentifier:bundleIdentifier];
+        // And now we install! Install under the signed id, but report progress
+        // under the original id that the UI is tracking.
+        [self _installIpaAtPath:outputIpaPath withBundleIdentifier:bundleIdentifier displayBundleIdentifier:[application bundleIdentifier]];
     }];
 }
 

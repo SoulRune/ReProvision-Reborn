@@ -17,6 +17,70 @@
 
 static auto dummy([](double) {});
 
+// Build the set of entitlement keys we're allowed to keep when re-signing. The
+// authoritative source is the provisioning profile Apple just issued for this app
+// (its "Entitlements" dict = exactly what this free account is permitted to use), so
+// we read it straight from the embedded.mobileprovision in the bundle. We union that
+// with the always-present basics plus game-center (benign and tolerated). Everything
+// NOT in this set - iCloud/CloudKit, associated-domains, app groups, push, and
+// private/jailbreak entitlements like platform-application / run-unsigned-code /
+// com.apple.private.* - is stripped, otherwise installd rejects the app (0xe8008001)
+// or it gets killed right after launch.
+static NSSet *RPVAllowedEntitlementKeys(NSString *bundlePath) {
+    NSMutableSet *allowed = [NSMutableSet setWithObjects:
+        @"application-identifier",
+        @"com.apple.developer.team-identifier",
+        @"keychain-access-groups",
+        @"get-task-allow",
+        @"com.apple.developer.game-center",
+        nil];
+
+    NSString *profilePath = [bundlePath stringByAppendingPathComponent:@"embedded.mobileprovision"];
+    NSString *content = [NSString stringWithContentsOfFile:profilePath encoding:NSISOLatin1StringEncoding error:nil];
+    NSRange s = [content rangeOfString:@"<plist"];
+    NSRange e = [content rangeOfString:@"</plist>"];
+    if (content && s.location != NSNotFound && e.location != NSNotFound) {
+        NSString *plistStr = [content substringWithRange:NSMakeRange(s.location, e.location + e.length - s.location)];
+        NSDictionary *prof = [NSPropertyListSerialization propertyListWithData:[plistStr dataUsingEncoding:NSUTF8StringEncoding] options:0 format:NULL error:nil];
+        NSDictionary *profEnt = prof[@"Entitlements"];
+        if ([profEnt isKindOfClass:[NSDictionary class]]) {
+            [allowed addObjectsFromArray:[profEnt allKeys]];
+        }
+    }
+
+    return allowed;
+}
+
+// Strip entitlements not in `allowed` from an XML entitlements string (used for
+// nested frameworks/dylibs, whose entitlements arrive as XML from ldid::Analyze).
+static std::string RPVSanitizeEntitlementsXML(const std::string &xml, NSSet *allowed) {
+    if (xml.empty()) return xml;
+
+    // The string may carry a trailing NUL / junk after </plist>; trim to the plist.
+    std::string trimmed = xml;
+    size_t end = trimmed.rfind("</plist>");
+    if (end != std::string::npos) trimmed = trimmed.substr(0, end + 8);
+
+    NSData *data = [NSData dataWithBytes:trimmed.data() length:trimmed.size()];
+    NSError *err = nil;
+    id plist = [NSPropertyListSerialization propertyListWithData:data options:NSPropertyListMutableContainers format:NULL error:&err];
+    if (![plist isKindOfClass:[NSDictionary class]]) return xml;
+
+    NSMutableDictionary *dict = (NSMutableDictionary *)plist;
+    BOOL changed = NO;
+    for (NSString *key in [dict allKeys]) {
+        if (![allowed containsObject:key]) {
+            [dict removeObjectForKey:key];
+            changed = YES;
+        }
+    }
+    if (!changed) return xml;
+
+    NSData *out = [NSPropertyListSerialization dataWithPropertyList:dict format:NSPropertyListXMLFormat_v1_0 options:0 error:&err];
+    if (out == nil) return xml;
+    return std::string((const char *)out.bytes, out.length);
+}
+
 @implementation EESigning
 
 + (instancetype)signerWithCertificate:(NSData *)certificate privateKey:(NSString *)privateKey {
@@ -100,8 +164,22 @@ static auto dummy([](double) {});
         return;
     }
 
+    // Strip entitlements this free profile doesn't grant (iCloud, associated-domains,
+    // push, app groups, platform-application, run-unsigned-code, com.apple.private.*,
+    // ...) before signing the MAIN executable - otherwise installd rejects the app
+    // (0xe8008001) or it's killed right after launch. The allowed set is derived from
+    // the actual provisioning profile, so it's as complete as the account permits.
+    NSSet *allowedEntitlementKeys = RPVAllowedEntitlementKeys(absolutePath);
+    NSMutableDictionary *cleanEntitlements = [entitlements mutableCopy] ?: [NSMutableDictionary dictionary];
+    for (NSString *key in [cleanEntitlements allKeys]) {
+        if (![allowedEntitlementKeys containsObject:key]) {
+            NSLog(@"*** [ReProvision] stripping unsupported entitlement: %@", key);
+            [cleanEntitlements removeObjectForKey:key];
+        }
+    }
+
     NSError *error;
-    NSMutableData *exportedPlist = [[NSPropertyListSerialization dataWithPropertyList:entitlements format:NSPropertyListXMLFormat_v1_0 options:0 error:&error] mutableCopy];
+    NSMutableData *exportedPlist = [[NSPropertyListSerialization dataWithPropertyList:cleanEntitlements format:NSPropertyListXMLFormat_v1_0 options:0 error:&error] mutableCopy];
     [exportedPlist appendBytes:"\x0" length:1];
 
     std::string entitlementsString = (char *)[exportedPlist bytes];
@@ -113,7 +191,27 @@ static auto dummy([](double) {});
     // We can now sign!
 
     ldid::DiskFolder folder([[absolutePath copy] cStringUsingEncoding:NSUTF8StringEncoding]);
-    ldid::Bundle outputBundle = Sign("", folder, _PKCS12, requirementsString, ldid::fun([&](const std::string &, const std::string &) -> std::string { return entitlementsString; }), ldid::fun([&](const std::string &) {}), ldid::fun(dummy));
+    // The alter callback runs for every Mach-O in the bundle. ldid passes the
+    // component's path prefix as the first argument: "" for the main executable, and
+    // the relative path (e.g. "Frameworks/Foo.framework/") for nested code. The main
+    // executable gets the (sanitized) app entitlements; nested code keeps its own with
+    // anything the profile doesn't grant stripped.
+    ldid::Bundle outputBundle = Sign("", folder, _PKCS12, requirementsString, ldid::fun([&](const std::string &path, const std::string &original) -> std::string {
+        std::string result;
+        if (path.empty()) {
+            // Main executable: gets the (sanitized) app entitlements.
+            result = entitlementsString;
+        } else if (path.find(".appex") != std::string::npos) {
+            // App extension: needs its own entitlements, just sanitized.
+            result = RPVSanitizeEntitlementsXML(original, allowedEntitlementKeys);
+        } else {
+            // Frameworks / dylibs: NO entitlements at all. Properly-built apps ship
+            // frameworks with no entitlements blob; leaving one here (even just
+            // get-task-allow) makes installd reject the whole bundle (0xe8008001).
+            result = "";
+        }
+        return result;
+    }), ldid::fun([&](const std::string &) {}), ldid::fun(dummy));
 
     // TODO: Handle errors!
 

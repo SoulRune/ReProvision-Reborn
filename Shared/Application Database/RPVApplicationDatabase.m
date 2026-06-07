@@ -77,6 +77,9 @@ static RPVApplicationDatabase *sharedDatabase;
 - (RPVApplication *)getApplicationContainsBundleIdentifier:(NSString *)bundleIdentifier {
     RPVApplication *application = nil;
 
+    // -containsString: throws on a nil argument.
+    if ([bundleIdentifier length] == 0) return nil;
+
     for (LSApplicationProxy *proxy in [[LSApplicationWorkspace defaultWorkspace] allApplications]) {
         if ([[proxy applicationIdentifier] containsString:bundleIdentifier] && [proxy isInstalled]) {
             // Success!

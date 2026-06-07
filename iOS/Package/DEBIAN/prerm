@@ -1,9 +1,18 @@
 #!/bin/bash
 
+JB_PREFIX="/var/jb"
+PLIST="${JB_PREFIX}/Library/LaunchDaemons/jp.soh.reprovisiond.plist"
+
 echo "Unloading daemon"
 
 if [ "$1" = remove ] || [ "$1" = purge ]; then
-    /bin/launchctl unload /Library/LaunchDaemons/jp.soh.reprovisiond.plist 2>/dev/null || /sbin/launchctl unload /Library/LaunchDaemons/jp.soh.reprovisiond.plist
+	LAUNCHCTL=""
+	for c in "${JB_PREFIX}/bin/launchctl" "${JB_PREFIX}/usr/bin/launchctl" "/bin/launchctl" "/usr/bin/launchctl"; do
+		if [ -x "$c" ]; then LAUNCHCTL="$c"; break; fi
+	done
+	if [ -n "$LAUNCHCTL" ] && [ -f "$PLIST" ]; then
+		"$LAUNCHCTL" bootout system "$PLIST" >/dev/null 2>&1 || "$LAUNCHCTL" unload "$PLIST" >/dev/null 2>&1 || true
+	fi
 fi
 
 exit 0

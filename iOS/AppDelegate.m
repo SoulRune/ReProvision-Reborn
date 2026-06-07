@@ -23,8 +23,6 @@
 #include <notify.h>
 #import <objc/runtime.h>
 
-@import Firebase;
-
 @interface PSAppDataUsagePolicyCache : NSObject
 + (id)sharedInstance;
 - (bool)setUsagePoliciesForBundle:(id)arg1 cellular:(bool)arg2 wifi:(bool)arg3;
@@ -39,6 +37,35 @@
 - (id)initWithMachServiceName:(NSString *)arg1;
 @end
 
+// Returns YES if ReProvision is installed as a real dpkg package, accounting for
+// both rootful (/var/lib/dpkg) and rootless (<jbroot>/var/lib/dpkg or
+// <jbroot>/Library/dpkg) jailbreak layouts. The jailbreak root is derived from
+// the app bundle location so we don't hardcode a single prefix.
+static BOOL RPVIsInstalledViaDpkg(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *listName = @"jp.soh.reprovision.list";
+
+    // Derive jailbreak root from the bundle path, e.g.
+    // /var/jb/Applications/ReProvision.app -> /var/jb
+    NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
+    NSString *jbRoot = @"";
+    NSRange appsRange = [bundlePath rangeOfString:@"/Applications/" options:NSBackwardsSearch];
+    if (appsRange.location != NSNotFound) {
+        jbRoot = [bundlePath substringToIndex:appsRange.location];
+    }
+
+    NSMutableArray<NSString *> *candidates = [NSMutableArray array];
+    for (NSString *prefix in @[jbRoot, @""]) {
+        [candidates addObject:[NSString stringWithFormat:@"%@/var/lib/dpkg/info/%@", prefix, listName]];
+        [candidates addObject:[NSString stringWithFormat:@"%@/Library/dpkg/info/%@", prefix, listName]];
+    }
+
+    for (NSString *path in candidates) {
+        if ([fm fileExistsAtPath:path]) return YES;
+    }
+    return NO;
+}
+
 @interface AppDelegate ()
 
 @property (nonatomic, strong) NSXPCConnection *daemonConnection;
@@ -51,9 +78,6 @@
 @implementation AppDelegate
 
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
-    // Enable Firebase Analytics if the plist file exists
-    if ([[NSFileManager defaultManager] fileExistsAtPath:[[NSBundle mainBundle] pathForResource:@"GoogleService-Info" ofType:@"plist"]]) [FIRApp configure];
-
     // Override point for customization after application launch.
     [[RPVApplicationSigning sharedInstance] addSigningUpdatesObserver:self];
 
@@ -103,7 +127,7 @@
     // nop
     NSLog(@"*** [ReProvision] :: applicationDidBecomeActive");
 
-    if (![[NSFileManager defaultManager] fileExistsAtPath:@"/var/lib/dpkg/info/jp.soh.reprovision.list"]) exit(1);
+    if (!RPVIsInstalledViaDpkg()) exit(1);
 
     self.applicationIsActive = YES;
     if (self.pendingDaemonConnectionAlert) {
@@ -179,6 +203,13 @@
         NSURLSessionDownloadTask *task = [session downloadTaskWithURL:ipaUrl];
 
         [task resume];
+
+    } else if ([url isFileURL] && [[[url pathExtension] lowercaseString] isEqualToString:@"ipa"]) {
+        // Direct "Open in ReProvision" of an .ipa from Files / another app. Without
+        // this branch the URL just fell through and nothing happened.
+        // RPVIpaBundleApplication handles the security-scoped read + local copy.
+        [self _showApplicationDetailControllerFromFileURL:url];
+        [self dismissLoadingAlert];
     }
 
     return YES;
@@ -189,6 +220,16 @@
         // Create an RPVApplication for this incoming .ipa, and display the installation popup.
 
         RPVIpaBundleApplication *ipaApplication = [[RPVIpaBundleApplication alloc] initWithIpaURL:url];
+
+        // If parsing failed there's no bundle id/name/icon. Show an error instead of
+        // an empty popup that crashes on install.
+        if ([[ipaApplication bundleIdentifier] length] == 0) {
+            [[RPVNotificationManager sharedInstance] sendNotificationWithTitle:@"Couldn't read IPA"
+                                                                          body:@"Failed to read this .ipa - it may not be accessible from the share sheet. Try the Add button inside ReProvision instead."
+                                                                isDebugMessage:NO
+                                                             andNotificationID:nil];
+            return;
+        }
 
         RPVApplicationDetailController *detailController = [[RPVApplicationDetailController alloc] initWithApplication:ipaApplication];
 
@@ -263,18 +304,33 @@
     // so we have to load it manually if the device is on iOS13+
     void *settingsCellular = dlopen("/System/Library/PrivateFrameworks/SettingsCellular.framework/SettingsCellular", RTLD_LAZY);
 
-    if (objc_getClass("PSAppDataUsagePolicyCache")) {
+    NSString *bundleId = [NSBundle mainBundle].bundleIdentifier;
+
+    // Guard every dynamic call with respondsToSelector:. These private selectors
+    // change between iOS releases (e.g. on iOS 16 PSAppDataUsagePolicyCache no
+    // longer implements setUsagePoliciesForBundle:cellular:wifi:); calling them
+    // blindly throws "unrecognized selector" and aborts the app at launch.
+    Class policyCacheClass = objc_getClass("PSAppDataUsagePolicyCache");
+    Class wirelessManagerClass = objc_getClass("AppWirelessDataUsageManager");
+
+    if (policyCacheClass && [policyCacheClass respondsToSelector:@selector(sharedInstance)]) {
         // iOS 12+
-        PSAppDataUsagePolicyCache *cache = [objc_getClass("PSAppDataUsagePolicyCache") sharedInstance];
-        [cache setUsagePoliciesForBundle:[NSBundle mainBundle].bundleIdentifier cellular:YES wifi:YES];
-    } else if (objc_getClass("AppWirelessDataUsageManager")) {
+        PSAppDataUsagePolicyCache *cache = [policyCacheClass sharedInstance];
+        if ([cache respondsToSelector:@selector(setUsagePoliciesForBundle:cellular:wifi:)]) {
+            [cache setUsagePoliciesForBundle:bundleId cellular:YES wifi:YES];
+        }
+    } else if (wirelessManagerClass) {
         // iOS 10 - 11
-        [objc_getClass("AppWirelessDataUsageManager") setAppWirelessDataOption:[NSNumber numberWithInt:3]
-                                                           forBundleIdentifier:[NSBundle mainBundle].bundleIdentifier
-                                                             completionHandler:nil];
-        [objc_getClass("AppWirelessDataUsageManager") setAppCellularDataEnabled:[NSNumber numberWithInt:1]
-                                                            forBundleIdentifier:[NSBundle mainBundle].bundleIdentifier
-                                                              completionHandler:nil];
+        if ([wirelessManagerClass respondsToSelector:@selector(setAppWirelessDataOption:forBundleIdentifier:completionHandler:)]) {
+            [wirelessManagerClass setAppWirelessDataOption:[NSNumber numberWithInt:3]
+                                       forBundleIdentifier:bundleId
+                                         completionHandler:nil];
+        }
+        if ([wirelessManagerClass respondsToSelector:@selector(setAppCellularDataEnabled:forBundleIdentifier:completionHandler:)]) {
+            [wirelessManagerClass setAppCellularDataEnabled:[NSNumber numberWithInt:1]
+                                        forBundleIdentifier:bundleId
+                                          completionHandler:nil];
+        }
     }
 
     // close SettingsCellular as it is not needed anymore.
@@ -330,15 +386,25 @@
 - (void)applicationSigningDidEncounterError:(NSError *)error forBundleIdentifier:(NSString *)bundleIdentifier {
     NSLog(@"'%@' had error: %@", bundleIdentifier, error);
 
-    NSString *applicationName = [[[RPVApplicationDatabase sharedInstance] getApplicationContainsBundleIdentifier:bundleIdentifier] applicationName];
-    [[RPVNotificationManager sharedInstance] sendNotificationWithTitle:@"Error" body:[NSString stringWithFormat:@"For '%@':\n%@", applicationName, error.localizedDescription] isDebugMessage:NO isUrgentMessage:YES andNotificationID:nil];
+    // bundleIdentifier can be nil (e.g. an IPA whose Info.plist failed to parse).
+    // getApplicationContainsBundleIdentifier: / containsString: / setObject:forKey:
+    // all throw on nil, which aborts the app instead of reporting the error.
+    NSString *applicationName = nil;
+    if ([bundleIdentifier length] > 0) {
+        applicationName = [[[RPVApplicationDatabase sharedInstance] getApplicationContainsBundleIdentifier:bundleIdentifier] applicationName];
+    }
+    if ([applicationName length] == 0) applicationName = @"application";
+
+    [[RPVNotificationManager sharedInstance] sendNotificationWithTitle:@"Error" body:[NSString stringWithFormat:@"For '%@':\n%@", applicationName, error.localizedDescription ?: @"Unknown error"] isDebugMessage:NO isUrgentMessage:YES andNotificationID:nil];
 
     // Ensure the UI goes back to when signing was not occuring
-    NSMutableDictionary *userInfo = [NSMutableDictionary dictionary];
-    [userInfo setObject:bundleIdentifier forKey:@"bundleIdentifier"];
-    [userInfo setObject:[NSNumber numberWithInt:100] forKey:@"percent"];
+    if ([bundleIdentifier length] > 0) {
+        NSMutableDictionary *userInfo = [NSMutableDictionary dictionary];
+        [userInfo setObject:bundleIdentifier forKey:@"bundleIdentifier"];
+        [userInfo setObject:[NSNumber numberWithInt:100] forKey:@"percent"];
 
-    [[NSNotificationCenter defaultCenter] postNotificationName:@"jp.soh.reprovision/signingUpdate" object:nil userInfo:userInfo];
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"jp.soh.reprovision/signingUpdate" object:nil userInfo:userInfo];
+    }
 }
 
 - (void)applicationSigningCompleteWithError:(NSError *)error {
