@@ -1,8 +1,9 @@
-name: Build rootless deb
+name: Build deb (rootless + rootful)
 
 on:
   push:
     branches: [master, main]
+    tags: ['*']
   pull_request:
   workflow_dispatch:
 
@@ -74,14 +75,50 @@ jobs:
             IPHONEOS_DEPLOYMENT_TARGET=15.0 \
             build | tee xcodebuild.log
 
+      - name: Build rootful .deb
+        run: |
+          set -e
+          # The Xcode build phase already produced the rootless .deb and left the
+          # signed app + daemon under iOS/Package/var/jb. Entitlements are
+          # path-independent, so the SAME signed binaries work at rootful paths -
+          # only the package layout/control/scripts differ. Reuse them here.
+          PKG="iOS/Package-rootful"
+          RL="iOS/Package/var/jb"
+
+          if [ ! -d "$RL/Applications/ReProvision.app" ] || [ ! -f "$RL/usr/libexec/reprovisiond" ]; then
+            echo "error: signed rootless products not found - did the build phase run?"
+            exit 1
+          fi
+
+          rm -rf "$PKG/Applications/ReProvision.app" "$PKG/usr/libexec/reprovisiond"
+          cp -R "$RL/Applications/ReProvision.app" "$PKG/Applications/"
+          cp "$RL/usr/libexec/reprovisiond" "$PKG/usr/libexec/"
+
+          MAJOR=$(/usr/libexec/PlistBuddy -c "Print :Major" iOS/PackageVersion.plist)
+          MINOR=$(/usr/libexec/PlistBuddy -c "Print :Minor" iOS/PackageVersion.plist)
+          BUGFIX=$(/usr/libexec/PlistBuddy -c "Print :BugFix" iOS/PackageVersion.plist)
+          STAGE=$(/usr/libexec/PlistBuddy -c "Print :Stage" iOS/PackageVersion.plist 2>/dev/null || echo "")
+          REV=$(/usr/libexec/PlistBuddy -c "Print :PackageRevision" iOS/PackageVersion.plist 2>/dev/null || echo "")
+          if [ -n "$REV" ]; then VERSION="${MAJOR}.${MINOR}.${BUGFIX}.${REV}${STAGE}"; else VERSION="${MAJOR}.${MINOR}.${BUGFIX}${STAGE}"; fi
+
+          /usr/libexec/PlistBuddy -c "Set :Version ${VERSION}" "$PKG/DEBIAN/control" >/dev/null 2>&1 || \
+            /usr/bin/sed -i '' -E "s/^Version:.*/Version: ${VERSION}/" "$PKG/DEBIAN/control"
+
+          chmod 0755 "$PKG/DEBIAN/postinst" "$PKG/DEBIAN/prerm" 2>/dev/null || true
+          find "$PKG" \( -name .DS_Store -o -name .gitkeep \) -delete 2>/dev/null || true
+
+          mkdir -p iOS/CydiaPackages
+          dpkg-deb -Zgzip -b "$PKG" "iOS/CydiaPackages/jp.soh.reprovision_${VERSION}_iphoneos-arm.deb"
+          echo "Built rootful iOS/CydiaPackages/jp.soh.reprovision_${VERSION}_iphoneos-arm.deb"
+
       - name: List produced debs
         run: |
           ls -la iOS/CydiaPackages/ || true
 
-      - name: Upload deb artifact
+      - name: Upload deb artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: reprovision-rootless-deb
+          name: reprovision-debs
           path: iOS/CydiaPackages/*.deb
           if-no-files-found: error
 
@@ -91,3 +128,21 @@ jobs:
         with:
           name: xcodebuild-log
           path: xcodebuild.log
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download deb artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*.deb
+          fail_on_unmatched_files: true

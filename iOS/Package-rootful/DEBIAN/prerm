@@ -1,0 +1,19 @@
+#!/bin/bash
+
+# Rootful layout: binaries live at the real root, not under /var/jb.
+JB_PREFIX=""
+PLIST="${JB_PREFIX}/Library/LaunchDaemons/jp.soh.reprovisiond.plist"
+
+echo "Unloading daemon"
+
+if [ "$1" = remove ] || [ "$1" = purge ]; then
+	LAUNCHCTL=""
+	for c in "/bin/launchctl" "/usr/bin/launchctl"; do
+		if [ -x "$c" ]; then LAUNCHCTL="$c"; break; fi
+	done
+	if [ -n "$LAUNCHCTL" ] && [ -f "$PLIST" ]; then
+		"$LAUNCHCTL" bootout system "$PLIST" >/dev/null 2>&1 || "$LAUNCHCTL" unload "$PLIST" >/dev/null 2>&1 || true
+	fi
+fi
+
+exit 0

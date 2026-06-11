@@ -1,0 +1,59 @@
+#!/bin/bash
+
+# Rootful layout: binaries live at the real root, not under /var/jb.
+JB_PREFIX=""
+PLIST="${JB_PREFIX}/Library/LaunchDaemons/jp.soh.reprovisiond.plist"
+
+function finish() {
+	f="${1}"
+
+	# No control fd: bail out
+	[[ -z "${f}" || -z "${CYDIA}" ]] && return
+	cydia=(${CYDIA})
+
+	# Cydia control fd version != 1: bail out
+	[[ ${cydia[1]} -eq 1 ]] || return
+
+	echo "finish:${f}" >&${cydia[0]}
+}
+
+# Clear Inbox folder
+if [ -d "/var/mobile/Library/Application Support/Containers/jp.soh.reprovision.ios/Documents/Inbox" ]; then
+	rm -rf "/var/mobile/Library/Application Support/Containers/jp.soh.reprovision.ios/Documents/Inbox"
+fi
+
+# Locate launchctl
+LAUNCHCTL=""
+for c in "/bin/launchctl" "/usr/bin/launchctl"; do
+	if [ -x "$c" ]; then LAUNCHCTL="$c"; break; fi
+done
+
+# Handle the daemon
+echo "(Re)-loading daemon..."
+
+if [ -f "$PLIST" ]; then
+	chown root:wheel "$PLIST" 2>/dev/null || true
+	chmod 644 "$PLIST" 2>/dev/null || true
+fi
+
+if [ -n "$LAUNCHCTL" ]; then
+	# bootstrap/bootout (modern) with fallback to load/unload (older launchctl)
+	"$LAUNCHCTL" bootout system "$PLIST" >/dev/null 2>&1 || "$LAUNCHCTL" unload "$PLIST" >/dev/null 2>&1 || true
+	"$LAUNCHCTL" bootstrap system "$PLIST" >/dev/null 2>&1 || "$LAUNCHCTL" load "$PLIST" >/dev/null 2>&1 || true
+fi
+
+# Reload application cache via uicache
+echo "Reloading application cache"
+UICACHE=""
+for c in "/usr/bin/uicache" "/bin/uicache"; do
+	if [ -x "$c" ]; then UICACHE="$c"; break; fi
+done
+if [ -n "$UICACHE" ]; then
+	"$UICACHE" -p "/Applications/ReProvision.app" || "$UICACHE" -a || true
+fi
+
+# Classic easter egg
+echo "Do, or do not. There is no try."
+
+finish restart
+exit 0
