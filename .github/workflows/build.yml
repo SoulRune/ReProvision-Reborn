@@ -90,6 +90,7 @@ jobs:
             exit 1
           fi
 
+          mkdir -p "$PKG/Applications" "$PKG/usr/libexec"
           rm -rf "$PKG/Applications/ReProvision.app" "$PKG/usr/libexec/reprovisiond"
           cp -R "$RL/Applications/ReProvision.app" "$PKG/Applications/"
           cp "$RL/usr/libexec/reprovisiond" "$PKG/usr/libexec/"

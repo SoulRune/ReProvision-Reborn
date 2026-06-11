@@ -27,6 +27,13 @@ jobs:
 
       - name: Run DevSkim scanner
         uses: microsoft/DevSkim-Action@v1
+        with:
+          # Don't scan vendored third-party / SDK code - it's the source of
+          # thousands of false positives (OpenSSL/corecrypto/IOKit headers,
+          # SSZipArchive's SHA-1, MD4 stubs, the "SSL" substring in OPENSSL_EXTERN,
+          # etc.). These aren't our code, and the SHA-1 we do use (code-signing
+          # cdhash) is mandated by the iOS signature format, not a weak-hash misuse.
+          ignore-globs: "**/Pods/**,**/include/**,**/Headers/**,**/Legacy/**,**/SSZipArchive/**,**/SAMKeychain/**,**/libProvision/openssl/**,**/*.tbd"
 
       - name: Upload DevSkim scan results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v4
