@@ -69,3 +69,61 @@
 + (NSString*)applicationTemporaryDirectory;
 
 @end
+
+#pragma mark - Signing log
+
+/**
+ Optional file logging for the signing pipeline.
+
+ Everything in the signing path uses NSLog, which on iOS goes only to os_log -
+ invisible unless you happen to be attached over SSH with `oslog` running at the exact
+ moment of failure.
+ Off by default. Toggle lives in Settings -> Advanced -> Signing Log.
+ */
+@interface RPVLogger : NSObject
+
+/// YES if file logging is currently enabled (reads the `logSigningToFile` preference).
++ (BOOL)isEnabled;
+
+/// Enable/disable file logging. Persists to NSUserDefaults.
++ (void)setEnabled:(BOOL)enabled;
+
+/// Absolute path of the current log file. Valid even when logging is disabled.
++ (NSString *)logFilePath;
+
+/// Absolute path of the rotated (previous) log file.
++ (NSString *)previousLogFilePath;
+
+/// Current log size in bytes (0 if no log exists).
++ (unsigned long long)logFileSize;
+
+/// Contents of previous + current log, oldest first. Nil if nothing logged yet.
++ (NSString *)logContents;
+
+/// Delete both current and rotated logs.
++ (void)clearLog;
+
+/// Write a line. No-op when disabled. Safe to call from any thread or queue.
++ (void)log:(NSString *)format, ... NS_FORMAT_FUNCTION(1, 2);
+
+/// Write a line without formatting. Still redacted.
++ (void)logRaw:(NSString *)message;
+
+/// Mark the start of a signing run — writes a banner with device/app context.
++ (void)beginSessionForBundle:(NSString *)bundleIdentifier;
+
+/// Mark the end of a signing run.
++ (void)endSessionSuccess:(BOOL)success message:(NSString *)message;
+
+@end
+
+/**
+ Drop-in replacement for NSLog: always goes to os_log, and additionally to the file
+ when logging is enabled. Behaviour with the toggle off is identical to plain NSLog
+ plus one BOOL read.
+ */
+#define RPVLog(fmt, ...)                              \
+    do {                                              \
+        NSLog(fmt, ##__VA_ARGS__);                    \
+        [RPVLogger log:fmt, ##__VA_ARGS__];           \
+    } while (0)

@@ -7,6 +7,7 @@
 //
 
 #import "EESigning.h"
+#import "EEBackend.h"   // for RPVLog / RPVLogger
 #include "ldid.hpp"
 
 #include <openssl/err.h>
@@ -130,7 +131,7 @@ static std::string RPVSanitizeEntitlementsXML(const std::string &xml, NSSet *all
                                             certificate:certificate
                                           andCAChainStack:chain];
         if (_PKCS12.size() == 0) {
-            NSLog(@"*** [ReProvision] PKCS12 creation returned empty - signing will fail");
+            RPVLog(@"*** [ReProvision] PKCS12 creation returned empty - signing will fail");
         }
     }
 
@@ -140,7 +141,7 @@ static std::string RPVSanitizeEntitlementsXML(const std::string &xml, NSSet *all
 + (NSMutableDictionary *)getEntitlementsForBinaryAtLocation:(NSString *)binaryLocation {
     NSMutableDictionary *plist = [NSMutableDictionary dictionary];
 
-    NSLog(@"Loading entitlements for: '%@'", binaryLocation);
+    RPVLog(@"Loading entitlements for: '%@'", binaryLocation);
 
     // Make sure to pass in the entitlements already present, updating as needed.
     NSData *binaryData = [NSData dataWithContentsOfFile:binaryLocation];
@@ -155,7 +156,7 @@ static std::string RPVSanitizeEntitlementsXML(const std::string &xml, NSSet *all
 
     std::string entitlements = ldid::Analyze([binaryData bytes], (size_t)[binaryData length]);
     if (entitlements.length() > 0) {
-        NSLog(@"Has entitlements in binary, so loading existing!");
+        RPVLog(@"Has entitlements in binary, so loading existing!");
         NSData *plistData = [NSData dataWithBytes:entitlements.data() length:entitlements.length()];
 
         NSError *error;
@@ -200,7 +201,7 @@ static std::string RPVSanitizeEntitlementsXML(const std::string &xml, NSSet *all
     NSMutableDictionary *cleanEntitlements = [entitlements mutableCopy] ?: [NSMutableDictionary dictionary];
     for (NSString *key in [cleanEntitlements allKeys]) {
         if (![mainAllowedKeys containsObject:key]) {
-            NSLog(@"*** [ReProvision] stripping unsupported entitlement: %@", key);
+            RPVLog(@"*** [ReProvision] stripping unsupported entitlement: %@", key);
             [cleanEntitlements removeObjectForKey:key];
         }
     }
@@ -209,14 +210,14 @@ static std::string RPVSanitizeEntitlementsXML(const std::string &xml, NSSet *all
     NSMutableData *exportedPlist = [[NSPropertyListSerialization dataWithPropertyList:cleanEntitlements format:NSPropertyListXMLFormat_v1_0 options:0 error:&error] mutableCopy];
     if (!exportedPlist) {
         NSString *reason = [NSString stringWithFormat:@"Failed to serialize entitlements: %@", error.localizedDescription ?: @"unknown"];
-        NSLog(@"*** [ReProvision] %@", reason);
+        RPVLog(@"*** [ReProvision] %@", reason);
         completionHandler(NO, reason);
         return;
     }
     [exportedPlist appendBytes:"\x0" length:1];
 
     std::string entitlementsString = (char *)[exportedPlist bytes];
-    NSLog(@"Entitlements are:\n%s", entitlementsString.c_str());
+    RPVLog(@"Entitlements are:\n%s", entitlementsString.c_str());
 
     std::string requirementsString = [self _createRequirementsBlobWithKey:_privateKey certificate:(NSData *)_certificate andBundleIdentifier:bundleIdentifier];
     //std::string requirementsString = "";
@@ -255,16 +256,16 @@ static std::string RPVSanitizeEntitlementsXML(const std::string &xml, NSSet *all
             ldid::fun(dummy));
     } catch (const char *msg) {
         NSString *reason = [NSString stringWithUTF8String:msg ? msg : "ldid: unknown assertion"];
-        NSLog(@"*** [ReProvision] ldid threw: %@", reason);
+        RPVLog(@"*** [ReProvision] ldid threw: %@", reason);
         completionHandler(NO, [NSString stringWithFormat:@"Signing failed: %@", reason]);
         return;
     } catch (const std::exception &ex) {
         NSString *reason = [NSString stringWithUTF8String:ex.what()];
-        NSLog(@"*** [ReProvision] ldid std::exception: %@", reason);
+        RPVLog(@"*** [ReProvision] ldid std::exception: %@", reason);
         completionHandler(NO, [NSString stringWithFormat:@"Signing failed: %@", reason]);
         return;
     } catch (...) {
-        NSLog(@"*** [ReProvision] ldid unknown C++ exception");
+        RPVLog(@"*** [ReProvision] ldid unknown C++ exception");
         completionHandler(NO, @"Signing failed: unknown internal error");
         return;
     }
@@ -310,14 +311,14 @@ static int RPVLoadAllCertsFromPEM(NSString *filepath, STACK_OF(X509) *outStack) 
         } else if (issuerHash == 0x9b16b75c) {
             preferred = [[NSBundle mainBundle] pathForResource:@"apple-ios-g3" ofType:@"pem"];
         } else {
-            NSLog(@"*** [ReProvision] Unrecognized issuer hash 0x%lx - falling back to full PEM search", issuerHash);
+            RPVLog(@"*** [ReProvision] Unrecognized issuer hash 0x%lx - falling back to full PEM search", issuerHash);
         }
         X509_free(certForHashCheck);
     }
 
     // Try preferred first
     if (preferred) {
-        NSLog(@"Loading CA chain from '%@'", preferred);
+        RPVLog(@"Loading CA chain from '%@'", preferred);
         RPVLoadAllCertsFromPEM(preferred, stack);
     }
 
@@ -333,13 +334,13 @@ static int RPVLoadAllCertsFromPEM(NSString *filepath, STACK_OF(X509) *outStack) 
 
     if (sk_X509_num(stack) == 0) {
         sk_X509_free(stack);
-        NSLog(@"Failed to load CA chain.");
+        RPVLog(@"Failed to load CA chain.");
         @throw [NSException exceptionWithName:@"libProvisionSigningException"
                                        reason:@"Could not load any CA intermediate from disk!"
                                      userInfo:nil];
     }
 
-    NSLog(@"Loaded %d intermediate certificate(s) into CA chain", sk_X509_num(stack));
+    RPVLog(@"Loaded %d intermediate certificate(s) into CA chain", sk_X509_num(stack));
     return stack;
 }
 
@@ -370,7 +371,7 @@ static int RPVLoadAllCertsFromPEM(NSString *filepath, STACK_OF(X509) *outStack) 
     NSString *rootCAFilepath = [[NSBundle mainBundle] pathForResource:@"root" ofType:@"pem"];
     NSString *rootCAContents = [NSString stringWithContentsOfFile:rootCAFilepath encoding:NSUTF8StringEncoding error:nil];
     if (!rootCAContents.length) {
-        NSLog(@"*** [ReProvision] Failed to read root.pem from bundle (path=%@)", rootCAFilepath);
+        RPVLog(@"*** [ReProvision] Failed to read root.pem from bundle (path=%@)", rootCAFilepath);
         if (chainStack) sk_X509_pop_free(chainStack, X509_free);
         return std::string("");
     }
@@ -379,7 +380,7 @@ static int RPVLoadAllCertsFromPEM(NSString *filepath, STACK_OF(X509) *outStack) 
     BIO_puts(rootCABio, [rootCAContents cStringUsingEncoding:NSUTF8StringEncoding]);
     X509 *rootCA = PEM_read_bio_X509(rootCABio, NULL, NULL, NULL);
     if (!rootCA) {
-        NSLog(@"*** [ReProvision] PEM_read_bio_X509(root) failed. OpenSSL: %s",
+        RPVLog(@"*** [ReProvision] PEM_read_bio_X509(root) failed. OpenSSL: %s",
               ERR_error_string(ERR_get_error(), NULL));
         BIO_free_all(rootCABio);
         if (chainStack) sk_X509_pop_free(chainStack, X509_free);
@@ -405,7 +406,7 @@ static int RPVLoadAllCertsFromPEM(NSString *filepath, STACK_OF(X509) *outStack) 
     BIO_puts(bio_privkey, [key cStringUsingEncoding:NSUTF8StringEncoding]);
     cert_privkey = PEM_read_bio_PrivateKey(bio_privkey, NULL, NULL, NULL);
     if (!cert_privkey) {
-        NSLog(@"*** [ReProvision] PEM_read_bio_PrivateKey failed. OpenSSL: %s",
+        RPVLog(@"*** [ReProvision] PEM_read_bio_PrivateKey failed. OpenSSL: %s",
               ERR_error_string(ERR_get_error(), NULL));
         error = -1;
     }
@@ -415,7 +416,7 @@ static int RPVLoadAllCertsFromPEM(NSString *filepath, STACK_OF(X509) *outStack) 
         const unsigned char *input = (unsigned char *)[certificate bytes];
         cert = d2i_X509(NULL, &input, (int)[certificate length]);
         if (!cert) {
-            NSLog(@"*** [ReProvision] d2i_X509(leaf) failed. OpenSSL: %s",
+            RPVLog(@"*** [ReProvision] d2i_X509(leaf) failed. OpenSSL: %s",
                   ERR_error_string(ERR_get_error(), NULL));
             error = -1;
         }
@@ -427,7 +428,7 @@ static int RPVLoadAllCertsFromPEM(NSString *filepath, STACK_OF(X509) *outStack) 
     if (error == 0) {
         cacertstack = sk_X509_new_null();
         if (!cacertstack) {
-            NSLog(@"*** [ReProvision] sk_X509_new_null failed");
+            RPVLog(@"*** [ReProvision] sk_X509_new_null failed");
             error = -1;
         } else {
             sk_X509_push(cacertstack, rootCA);
@@ -441,7 +442,7 @@ static int RPVLoadAllCertsFromPEM(NSString *filepath, STACK_OF(X509) *outStack) 
                 sk_X509_free(chainStack);  // container empty - safe to just free
                 chainStack = NULL;
             }
-            NSLog(@"[ReProvision] PKCS12: CA stack size=%d, have leaf=%d, have key=%d",
+            RPVLog(@"[ReProvision] PKCS12: CA stack size=%d, have leaf=%d, have key=%d",
                   sk_X509_num(cacertstack), cert != NULL, cert_privkey != NULL);
         }
     }
@@ -457,12 +458,12 @@ static int RPVLoadAllCertsFromPEM(NSString *filepath, STACK_OF(X509) *outStack) 
             0, 0, 0, 0, 0
         );
         if (!pkcs12bundle) {
-            NSLog(@"*** [ReProvision] PKCS12_create failed. OpenSSL: %s",
+            RPVLog(@"*** [ReProvision] PKCS12_create failed. OpenSSL: %s",
                   ERR_error_string(ERR_get_error(), NULL));
             // Drain the whole OpenSSL error queue too - PKCS12_create can push several
             unsigned long e;
             while ((e = ERR_get_error()) != 0) {
-                NSLog(@"*** [ReProvision]   further OpenSSL error: %s",
+                RPVLog(@"*** [ReProvision]   further OpenSSL error: %s",
                       ERR_error_string(e, NULL));
             }
             error = -1;
@@ -475,13 +476,13 @@ static int RPVLoadAllCertsFromPEM(NSString *filepath, STACK_OF(X509) *outStack) 
         bio_pkcs12 = BIO_new(BIO_s_mem());
         bytes = i2d_PKCS12_bio(bio_pkcs12, pkcs12bundle);
         if (bytes <= 0) {
-            NSLog(@"*** [ReProvision] i2d_PKCS12_bio failed. OpenSSL: %s",
+            RPVLog(@"*** [ReProvision] i2d_PKCS12_bio failed. OpenSSL: %s",
                   ERR_error_string(ERR_get_error(), NULL));
             error = -1;
         } else {
             len = BIO_get_mem_data(bio_pkcs12, &data);
             result = [NSData dataWithBytes:data length:len];
-            NSLog(@"[ReProvision] PKCS12 built OK, %ld bytes", len);
+            RPVLog(@"[ReProvision] PKCS12 built OK, %ld bytes", len);
         }
     }
 
@@ -533,14 +534,14 @@ static int RPVLoadAllCertsFromPEM(NSString *filepath, STACK_OF(X509) *outStack) 
     BIO_puts(bio_privkey, [key cStringUsingEncoding:NSUTF8StringEncoding]);
     
     if (!(cert_privkey = PEM_read_bio_PrivateKey(bio_privkey, NULL, NULL, NULL))) {
-        NSLog(@"Error loading certificate private key content.");
+        RPVLog(@"Error loading certificate private key content.");
         return "";
     }
     
     const unsigned char *input = (unsigned char*)[certificate bytes];
     cert = d2i_X509(NULL, &input, (int)[certificate length]);
     if (!cert) {
-        NSLog(@"Error loading cert into memory.");
+        RPVLog(@"Error loading cert into memory.");
         return "";
     }
     
@@ -553,7 +554,7 @@ static int RPVLoadAllCertsFromPEM(NSString *filepath, STACK_OF(X509) *outStack) 
     OSStatus status = SecRequirementCreateWithString((__bridge CFStringRef)requirementsString, kSecCSDefaultFlags, &requirementRef);
     
     if (status != noErr) {
-        NSLog(@"Error: Failed to create requirements! %d", (int)status);
+        RPVLog(@"Error: Failed to create requirements! %d", (int)status);
         
         return "";
     }
@@ -563,7 +564,7 @@ static int RPVLoadAllCertsFromPEM(NSString *filepath, STACK_OF(X509) *outStack) 
     status = SecRequirementCopyData(requirementRef, kSecCSDefaultFlags, &data);
     
     if (status != noErr) {
-        NSLog(@"Error: Failed to copy requirements! %d", (int)status);
+        RPVLog(@"Error: Failed to copy requirements! %d", (int)status);
         
         return "";
     }

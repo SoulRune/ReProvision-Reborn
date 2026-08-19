@@ -9,6 +9,7 @@
 #import "RPVAdvancedController.h"
 #import "AppDelegate.h"
 #import "RPVResources.h"
+#import "EEBackend.h"   // RPVLogger lives here
 
 #include <notify.h>
 
@@ -125,7 +126,86 @@
 
     [array addObject:startBackgroundSign];
 
+    // --- Signing log ---------------------------------------------------------
+    PSSpecifier *logGroup = [PSSpecifier groupSpecifierWithName:@"Signing Log"];
+    [logGroup setProperty:@"Writes the full signing process to a file, so a failure can be inspected afterwards instead of needing a syslog capture at the moment it happens.\n\nApple ID addresses, tokens and private keys are redacted, but review the log before sharing it." forKey:@"footerText"];
+    [array addObject:logGroup];
+
+    PSSpecifier *logToggle = [PSSpecifier preferenceSpecifierNamed:@"Log Signing to File" target:self set:@selector(setPreferenceValue:specifier:) get:@selector(readPreferenceValue:) detail:nil cell:PSSwitchCell edit:nil];
+    [logToggle setProperty:@"logSigningToFile" forKey:@"key"];
+    [logToggle setProperty:@0 forKey:@"default"];
+    [array addObject:logToggle];
+
+    unsigned long long logBytes = [RPVLogger logFileSize];
+    NSString *sizeTitle;
+    if (logBytes == 0) {
+        sizeTitle = @"Log Size: empty";
+    } else if (logBytes < 1024) {
+        sizeTitle = [NSString stringWithFormat:@"Log Size: %llu bytes", logBytes];
+    } else if (logBytes < 1024 * 1024) {
+        sizeTitle = [NSString stringWithFormat:@"Log Size: %.1f KB", logBytes / 1024.0];
+    } else {
+        sizeTitle = [NSString stringWithFormat:@"Log Size: %.1f MB", logBytes / (1024.0 * 1024.0)];
+    }
+    PSSpecifier *logSize = [PSSpecifier preferenceSpecifierNamed:sizeTitle target:self set:nil get:nil detail:nil cell:PSStaticTextCell edit:nil];
+    [array addObject:logSize];
+
+    PSSpecifier *shareLog = [PSSpecifier preferenceSpecifierNamed:@"Share Log" target:self set:nil get:nil detail:nil cell:PSButtonCell edit:nil];
+    shareLog->action = @selector(shareSigningLog:);
+    [array addObject:shareLog];
+
+    PSSpecifier *clearLog = [PSSpecifier preferenceSpecifierNamed:@"Clear Log" target:self set:nil get:nil detail:nil cell:PSButtonCell edit:nil];
+    clearLog->action = @selector(clearSigningLog:);
+    [array addObject:clearLog];
+
     return array;
+}
+
+#pragma mark - Signing log actions
+
+- (void)shareSigningLog:(id)sender {
+    if ([RPVLogger logFileSize] == 0) {
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"No Log Yet"
+                                                                      message:@"Turn on \"Log Signing to File\", then sign an application. The log will appear here."
+                                                               preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+        return;
+    }
+
+    // Share the file itself rather than a string, so it arrives with a filename and can
+    // be attached to a bug report directly.
+    NSURL *url = [NSURL fileURLWithPath:[RPVLogger logFilePath]];
+    UIActivityViewController *share = [[UIActivityViewController alloc] initWithActivityItems:@[url]
+                                                                        applicationActivities:nil];
+
+    // iPad requires a popover anchor here or this throws.
+    if (share.popoverPresentationController) {
+        share.popoverPresentationController.sourceView = self.view;
+        share.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(self.view.bounds),
+                                                                    CGRectGetMidY(self.view.bounds),
+                                                                    0, 0);
+        share.popoverPresentationController.permittedArrowDirections = 0;
+    }
+
+    [self presentViewController:share animated:YES completion:nil];
+}
+
+- (void)clearSigningLog:(id)sender {
+    UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"Clear Log?"
+                                                                    message:@"This deletes the saved signing log. It can't be undone."
+                                                             preferredStyle:UIAlertControllerStyleAlert];
+
+    [confirm addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [confirm addAction:[UIAlertAction actionWithTitle:@"Clear" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        [RPVLogger clearLog];
+
+        // Reload so the size row refreshes.
+        self->_specifiers = nil;
+        [self reloadSpecifiers];
+    }]];
+
+    [self presentViewController:confirm animated:YES completion:nil];
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {

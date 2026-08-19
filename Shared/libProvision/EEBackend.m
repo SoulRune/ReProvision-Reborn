@@ -118,14 +118,14 @@ static NSString *RPVComputeNewBundleID(NSString *originalId, NSString *parentOri
             // Enter the dispatch group
             dispatch_group_enter(dispatch_group);
 
-            NSLog(@"Handling sub-bundle: %@", subBundlePath);
+            RPVLog(@"Handling sub-bundle: %@", subBundlePath);
 
             // Sign the bundle
             [self signBundleAtPath:subBundlePath identity:identity gsToken:gsToken priorChosenTeamID:teamId parentOriginalBundleID:myOriginalBundleID parentNewBundleID:myNewBundleID withCompletionHandler:^(NSError *error) {
                 if (error)
                     [subBundleErrors addObject:error];
 
-                NSLog(@"Finished sub-bundle: %@", subBundlePath);
+                RPVLog(@"Finished sub-bundle: %@", subBundlePath);
                 dispatch_group_leave(dispatch_group);
             }];
         }
@@ -140,14 +140,14 @@ static NSString *RPVComputeNewBundleID(NSString *originalId, NSString *parentOri
             // Enter the dispatch group
             dispatch_group_enter(dispatch_group);
 
-            NSLog(@"Handling sub-bundle: %@", subBundlePath);
+            RPVLog(@"Handling sub-bundle: %@", subBundlePath);
 
             // Sign the bundle
             [self signBundleAtPath:subBundlePath identity:identity gsToken:gsToken priorChosenTeamID:teamId parentOriginalBundleID:myOriginalBundleID parentNewBundleID:myNewBundleID withCompletionHandler:^(NSError *error) {
                 if (error)
                     [subBundleErrors addObject:error];
 
-                NSLog(@"Handled sub-bundle: %@", subBundlePath);
+                RPVLog(@"Handled sub-bundle: %@", subBundlePath);
                 dispatch_group_leave(dispatch_group);
             }];
         }
@@ -159,7 +159,7 @@ static NSString *RPVComputeNewBundleID(NSString *originalId, NSString *parentOri
     if (subBundleErrors.count > 0) {
         // Errors when handling sub-bundles!
         for (NSError *err in subBundleErrors) {
-            NSLog(@"Error: %@", err.localizedDescription);
+            RPVLog(@"Error: %@", err.localizedDescription);
         }
 
         completionHandler([subBundleErrors lastObject]);
@@ -192,7 +192,7 @@ static NSString *RPVComputeNewBundleID(NSString *originalId, NSString *parentOri
         systemType = EESystemTypeiOS;
     }
 
-    NSLog(@"Platform: %@ for bundle: %@", platformName, [path lastPathComponent]);
+    RPVLog(@"Platform: %@ for bundle: %@", platformName, [path lastPathComponent]);
 
     NSString *applicationId = [infoplist objectForKey:@"CFBundleIdentifier"];
     NSString *embeddedPath = [NSString stringWithFormat:@"%@/embedded.mobileprovision", path];
@@ -230,7 +230,7 @@ static NSString *RPVComputeNewBundleID(NSString *originalId, NSString *parentOri
         [infoplist setObject:applicationId forKey:@"REBundleIdentifier"];
 
     applicationId = RPVComputeNewBundleID(applicationId, parentOriginalBundleID, parentNewBundleID, teamId);
-    NSLog(@"[ReProvision] Bundle ID: %@ -> %@ (parent: %@ -> %@)",
+    RPVLog(@"[ReProvision] Bundle ID: %@ -> %@ (parent: %@ -> %@)",
           [infoplist objectForKey:@"REBundleIdentifier"] ?: @"(none)", applicationId,
           parentOriginalBundleID ?: @"(top-level)", parentNewBundleID ?: @"(top-level)");
     [infoplist setObject:applicationId forKey:@"CFBundleIdentifier"];
@@ -240,7 +240,7 @@ static NSString *RPVComputeNewBundleID(NSString *originalId, NSString *parentOri
     NSString *companion = [infoplist objectForKey:@"WKCompanionAppBundleIdentifier"];
     if (companion.length && parentNewBundleID.length) {
         [infoplist setObject:parentNewBundleID forKey:@"WKCompanionAppBundleIdentifier"];
-        NSLog(@"[ReProvision] WKCompanionAppBundleIdentifier: %@ -> %@", companion, parentNewBundleID);
+        RPVLog(@"[ReProvision] WKCompanionAppBundleIdentifier: %@ -> %@", companion, parentNewBundleID);
     }
 
     NSError *error = nil;
@@ -252,7 +252,7 @@ static NSString *RPVComputeNewBundleID(NSString *originalId, NSString *parentOri
     }
 
     if (error) {
-        NSLog(@"%@", error);
+        RPVLog(@"%@", error);
         return;
     }
 
@@ -285,16 +285,16 @@ static NSString *RPVComputeNewBundleID(NSString *originalId, NSString *parentOri
             [[NSFileManager defaultManager] removeItemAtPath:embeddedPath error:&fileIOError];
 
             if (fileIOError) {
-                NSLog(@"%@", fileIOError);
+                RPVLog(@"%@", fileIOError);
                 return;
             }
         }
 
         if (![(NSData *)embeddedMobileProvision writeToFile:embeddedPath options:NSDataWritingAtomic error:&fileIOError]) {
             if (fileIOError) {
-                NSLog(@"%@", fileIOError);
+                RPVLog(@"%@", fileIOError);
             } else {
-                NSLog(@"Failed to write '%@'.", embeddedPath);
+                RPVLog(@"Failed to write '%@'.", embeddedPath);
             }
 
             return;
@@ -359,10 +359,17 @@ static NSString *RPVComputeNewBundleID(NSString *originalId, NSString *parentOri
 
     NSString *bundleDirectory = [NSString stringWithFormat:@"%@/%@", payloadDirectory, dotAppDirectory];
 
-    NSLog(@"Signing bundle at path '%@'", bundleDirectory);
+    // Open a log session so a failed run reads as one self-contained block in the file.
+    {
+        NSDictionary *ip = [NSDictionary dictionaryWithContentsOfFile:[NSString stringWithFormat:@"%@/Info.plist", bundleDirectory]];
+        [RPVLogger beginSessionForBundle:RPVOriginalBundleIDFromInfoPlist(ip)];
+    }
+
+    RPVLog(@"Signing bundle at path '%@'", bundleDirectory);
 
     [self signBundleAtPath:bundleDirectory identity:identity gsToken:gsToken priorChosenTeamID:teamId withCompletionHandler:^(NSError *err) {
         if (err) {
+            [RPVLogger endSessionSuccess:NO message:err.localizedDescription];
             completionHandler(err);
             return;
         }
@@ -370,9 +377,11 @@ static NSString *RPVComputeNewBundleID(NSString *originalId, NSString *parentOri
         // 3. Repack IPA to output path
         NSError *error2;
         if (![self repackIpaAtPath:[NSString stringWithFormat:@"%@/%@", [self applicationTemporaryDirectory], zipFilename] toPath:outputPath error:&error2]) {
+            [RPVLogger endSessionSuccess:NO message:[NSString stringWithFormat:@"Repack failed: %@", error2.localizedDescription]];
             completionHandler(error2);
         } else {
             // Success!
+            [RPVLogger endSessionSuccess:YES message:nil];
             completionHandler(nil);
         }
     }];
@@ -397,7 +406,7 @@ static NSString *RPVComputeNewBundleID(NSString *originalId, NSString *parentOri
 
     *outputDirectory = [NSString stringWithFormat:@"%@/%@", [self applicationTemporaryDirectory], zipFilename];
 
-    NSLog(@"Unpacking '%@' into directory '%@'", ipaPath, *outputDirectory);
+    RPVLog(@"Unpacking '%@' into directory '%@'", ipaPath, *outputDirectory);
 
     if (![SSZipArchive unzipFileAtPath:ipaPath toDestination:*outputDirectory]) {
         if (error)
@@ -416,7 +425,7 @@ static NSString *RPVComputeNewBundleID(NSString *originalId, NSString *parentOri
         return NO;
     }
 
-    NSLog(@"Creating IPA from contents of '%@", extractedPath);
+    RPVLog(@"Creating IPA from contents of '%@", extractedPath);
 
     // Ensure permissions are at least read on everyone.
 
@@ -454,6 +463,239 @@ static NSString *RPVComputeNewBundleID(NSString *originalId, NSString *parentOri
                                      userInfo:userInfo];
 
     return error;
+}
+
+@end
+
+#pragma mark - RPVLogger
+
+#if __has_include(<UIKit/UIKit.h>)
+#import <UIKit/UIKit.h>
+#endif
+#import <sys/utsname.h>
+
+static NSString * const kRPVLogEnabledKey = @"logSigningToFile";
+static NSString * const kRPVLogFileName = @"ReProvision-signing.log";
+static NSString * const kRPVLogPrevFileName = @"ReProvision-signing.1.log";
+
+// Rotate at 2 MB and keep one previous file, so worst case is ~4 MB on disk. Without
+// this, months of automatic re-signing would grow the log unbounded.
+static const unsigned long long kRPVLogMaxBytes = 2 * 1024 * 1024;
+
+@implementation RPVLogger
+
+#pragma mark Queue
+
+// All file IO funnels through one serial queue. The signing pipeline runs across a
+// dispatch_group, the NSURLSession delegate queue and the main queue simultaneously, so
+// unsynchronised appends would interleave mid-line and race on the rotation check.
++ (dispatch_queue_t)_queue {
+    static dispatch_queue_t queue;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        queue = dispatch_queue_create("jp.soh.reprovision.logger", DISPATCH_QUEUE_SERIAL);
+    });
+    return queue;
+}
+
+#pragma mark Paths
+
++ (NSString *)_logDirectory {
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    return [paths firstObject];
+}
+
++ (NSString *)logFilePath {
+    return [[self _logDirectory] stringByAppendingPathComponent:kRPVLogFileName];
+}
+
++ (NSString *)previousLogFilePath {
+    return [[self _logDirectory] stringByAppendingPathComponent:kRPVLogPrevFileName];
+}
+
++ (unsigned long long)logFileSize {
+    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:[self logFilePath] error:nil];
+    return attrs ? [attrs fileSize] : 0;
+}
+
+#pragma mark Enablement
+
++ (BOOL)isEnabled {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:kRPVLogEnabledKey];
+}
+
++ (void)setEnabled:(BOOL)enabled {
+    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kRPVLogEnabledKey];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+
+    if (enabled) {
+        [self logRaw:@"=== File logging enabled ==="];
+    }
+}
+
+#pragma mark Redaction
+
+// Signing logs carry Apple ID responses, provisioning profile XML and, on some paths,
+// the raw private key. None of that should land in a file a user might attach to a
+// GitHub issue, so scrub the obvious carriers before writing.
++ (NSString *)_redact:(NSString *)message {
+    if (message.length == 0) return message;
+
+    static NSRegularExpression *pemRegex;
+    static NSRegularExpression *plistKeyRegex;
+    static NSRegularExpression *emailRegex;
+    static NSRegularExpression *tokenRegex;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        pemRegex = [NSRegularExpression regularExpressionWithPattern:
+                    @"-----BEGIN[^-]+-----[\\s\\S]*?-----END[^-]+-----" options:0 error:nil];
+        plistKeyRegex = [NSRegularExpression regularExpressionWithPattern:
+                         @"(?i)<key>(password|myacinfo|gsToken|gs-token|sessionToken|privateKey|identityToken|dsid)</key>\\s*<string>[^<]*</string>" options:0 error:nil];
+        emailRegex = [NSRegularExpression regularExpressionWithPattern:
+                      @"\\b[\\w._%+-]+@[\\w.-]+\\.[A-Za-z]{2,}\\b" options:0 error:nil];
+        // Deliberately aggressive: also catches long hashes that aren't secret. That's
+        // the right trade-off for a file people paste into issues. Loosen if it eats
+        // something you need while debugging.
+        tokenRegex = [NSRegularExpression regularExpressionWithPattern:
+                      @"\\b[A-Za-z0-9+/=_-]{40,}\\b" options:0 error:nil];
+    });
+
+    NSMutableString *out = [message mutableCopy];
+    [pemRegex replaceMatchesInString:out options:0 range:NSMakeRange(0, out.length) withTemplate:@"[REDACTED PEM BLOCK]"];
+    [plistKeyRegex replaceMatchesInString:out options:0 range:NSMakeRange(0, out.length) withTemplate:@"[REDACTED PLIST SECRET]"];
+    [emailRegex replaceMatchesInString:out options:0 range:NSMakeRange(0, out.length) withTemplate:@"[REDACTED EMAIL]"];
+    [tokenRegex replaceMatchesInString:out options:0 range:NSMakeRange(0, out.length) withTemplate:@"[REDACTED TOKEN]"];
+    return out;
+}
+
+#pragma mark Writing
+
++ (void)_appendLine:(NSString *)line {
+    // Must be called on _queue.
+    NSString *path = [self logFilePath];
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    NSDictionary *attrs = [fm attributesOfItemAtPath:path error:nil];
+    if (attrs && [attrs fileSize] >= kRPVLogMaxBytes) {
+        NSString *prev = [self previousLogFilePath];
+        [fm removeItemAtPath:prev error:nil];
+        [fm moveItemAtPath:path toPath:prev error:nil];
+    }
+
+    if (![fm fileExistsAtPath:path]) {
+        [fm createFileAtPath:path contents:nil attributes:nil];
+    }
+
+    NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!handle) return;
+
+    @try {
+        [handle seekToEndOfFile];
+        [handle writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+    } @catch (NSException *e) {
+        // Disk full, sandbox weirdness, etc. Logging must never take down a signing run.
+        NSLog(@"[RPVLogger] write failed: %@", e.reason);
+    } @finally {
+        [handle closeFile];
+    }
+}
+
++ (NSString *)_timestamp {
+    static NSDateFormatter *formatter;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        formatter = [[NSDateFormatter alloc] init];
+        formatter.dateFormat = @"yyyy-MM-dd HH:mm:ss.SSS";
+        formatter.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    });
+    return [formatter stringFromDate:[NSDate date]];
+}
+
++ (void)logRaw:(NSString *)message {
+    if (![self isEnabled]) return;
+    if (message.length == 0) return;
+
+    NSString *line = [NSString stringWithFormat:@"%@  %@\n", [self _timestamp], [self _redact:message]];
+
+    dispatch_async([self _queue], ^{
+        [self _appendLine:line];
+    });
+}
+
++ (void)log:(NSString *)format, ... {
+    if (![self isEnabled]) return;
+
+    va_list args;
+    va_start(args, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+
+    [self logRaw:message];
+}
+
+#pragma mark Sessions
+
++ (void)beginSessionForBundle:(NSString *)bundleIdentifier {
+    if (![self isEnabled]) return;
+
+    struct utsname systemInfo;
+    uname(&systemInfo);
+    NSString *model = [NSString stringWithCString:systemInfo.machine encoding:NSUTF8StringEncoding];
+
+    NSString *appVersion = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?";
+    NSString *appBuild = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"] ?: @"?";
+
+    NSString *osVersion;
+#if __has_include(<UIKit/UIKit.h>)
+    osVersion = [[UIDevice currentDevice] systemVersion];
+#else
+    osVersion = [[NSProcessInfo processInfo] operatingSystemVersionString];
+#endif
+
+    NSMutableString *banner = [NSMutableString string];
+    [banner appendString:@"\n"];
+    [banner appendString:@"================================================================\n"];
+    [banner appendFormat:@"  SIGNING SESSION START — %@\n", bundleIdentifier ?: @"(unknown bundle)"];
+    [banner appendFormat:@"  ReProvision %@ (%@)\n", appVersion, appBuild];
+    [banner appendFormat:@"  OS %@ on %@\n", osVersion, model];
+    [banner appendString:@"================================================================"];
+
+    [self logRaw:banner];
+}
+
++ (void)endSessionSuccess:(BOOL)success message:(NSString *)message {
+    if (![self isEnabled]) return;
+
+    NSMutableString *banner = [NSMutableString string];
+    [banner appendFormat:@"  SIGNING SESSION END — %@", success ? @"SUCCESS" : @"FAILED"];
+    if (message.length) {
+        [banner appendFormat:@"\n  %@", message];
+    }
+    [banner appendString:@"\n================================================================\n"];
+
+    [self logRaw:banner];
+}
+
+#pragma mark Reading / clearing
+
++ (NSString *)logContents {
+    NSMutableString *combined = [NSMutableString string];
+
+    NSString *prev = [NSString stringWithContentsOfFile:[self previousLogFilePath] encoding:NSUTF8StringEncoding error:nil];
+    if (prev.length) [combined appendString:prev];
+
+    NSString *current = [NSString stringWithContentsOfFile:[self logFilePath] encoding:NSUTF8StringEncoding error:nil];
+    if (current.length) [combined appendString:current];
+
+    return combined.length ? combined : nil;
+}
+
++ (void)clearLog {
+    dispatch_async([self _queue], ^{
+        NSFileManager *fm = [NSFileManager defaultManager];
+        [fm removeItemAtPath:[self logFilePath] error:nil];
+        [fm removeItemAtPath:[self previousLogFilePath] error:nil];
+    });
 }
 
 @end

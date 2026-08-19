@@ -7,6 +7,7 @@
 //
 
 #import "EEProvisioning.h"
+#import "EEBackend.h"   // for RPVLog / RPVLogger
 #import "EESigning.h"
 #import "SAMKeychain.h"
 
@@ -205,7 +206,7 @@
     [self _signIn:_identity gsToken:_gsToken withCallback:^(NSError *error) {
         if (!error) {
             // Only continue if authenticated!
-            NSLog(@"Authenticated!");
+            RPVLog(@"Authenticated!");
 
             [[EEAppleServices sharedInstance] updateCurrentTeamIDWithTeamIDCheck:teamIDCallback andCallback:^(NSError *error, NSString *teamid) {
                 if (error) {
@@ -216,7 +217,7 @@
 
                 // TODO: Check plist for errors.
 
-                NSLog(@"Team ID: %@", teamid);
+                RPVLog(@"Team ID: %@", teamid);
 
                 if ([teamid isEqualToString:@""]) {
                     // We shouldn't ever reach this, but the logic is present just in case.
@@ -264,7 +265,7 @@
 
     [self _handleDevelopmentCodesigningRequestIfNecessary:^(NSError *error, NSString *privateKey, NSDictionary *certificate) {
         if (!error) {
-            NSLog(@"We have a development certificate that can be used!");
+            RPVLog(@"We have a development certificate that can be used!");
         }
 
         completionHandler(error, privateKey, certificate);
@@ -359,7 +360,7 @@
                 else
                     reason = @"this certificate being expired.";
 
-                NSLog(@"Revoking certificate with identifier '%@', due to %@", certId, reason);
+                RPVLog(@"Revoking certificate with identifier '%@', due to %@", certId, reason);
 
                 [[EEAppleServices sharedInstance] revokeCertificateForIdentifier:certId andTeamID:[[EEAppleServices sharedInstance] currentTeamID] systemType:systemType withCompletionHandler:^(NSError *error, NSDictionary *plist) {
                     if (error) {
@@ -454,7 +455,7 @@
         return;
     }
 
-    NSLog(@"Generated a codesigning request, submitting...");
+    RPVLog(@"Generated a codesigning request, submitting...");
 
     // Going to add a prefix to the machine name.
     machineName = [NSString stringWithFormat:@"RPV- %@", machineName];
@@ -857,7 +858,7 @@ free_all:
 
             if (!appIdExists) {
                 // /addAppId
-                NSLog(@"This appId doesn't exist yet, so making a new one.");
+                RPVLog(@"This appId doesn't exist yet, so making a new one.");
 
                 [[EEAppleServices sharedInstance] addApplicationId:identifier name:name enabledFeatures:enabledFeatures teamID:[[EEAppleServices sharedInstance] currentTeamID] entitlements:entitlements systemType:systemType withCompletionHandler:^(NSError *error, NSDictionary *plist) {
                     if (error) {
@@ -900,7 +901,7 @@ free_all:
                 }];
             } else {
                 // /updateAppId
-                NSLog(@"This appId already exists, so updating it.");
+                RPVLog(@"This appId already exists, so updating it.");
 
                 [[EEAppleServices sharedInstance] updateApplicationIdId:appIdIdIfExists enabledFeatures:enabledFeatures teamID:[[EEAppleServices sharedInstance] currentTeamID] entitlements:entitlements systemType:systemType withCompletionHandler:^(NSError *error, NSDictionary *plist) {
                     if (error) {
@@ -1074,7 +1075,7 @@ free_all:
 
 - (void)_assignAppIdId:(NSString *)appIdId toApplicationGroupIdentifier:(NSString *)groupIdentifier systemType:(EESystemType)systemType withCompletionHandler:(void (^)(NSError *))completionHandler {
     // Assign to application group.
-    NSLog(@"Assigning appIdId '%@' to application group '%@'", appIdId, groupIdentifier);
+    RPVLog(@"Assigning appIdId '%@' to application group '%@'", appIdId, groupIdentifier);
 
     [[EEAppleServices sharedInstance] assignApplicationGroup:groupIdentifier toApplicationIdId:appIdId teamID:[[EEAppleServices sharedInstance] currentTeamID] systemType:systemType withCompletionHandler:^(NSError *error, NSDictionary *plist) {
         if (error) {
@@ -1108,7 +1109,7 @@ free_all:
                                               withCallback:^(NSError *error) {
                                                   // No need to worry if this actually succeeded or not.
 
-                                                  NSLog(@"Fetching new provisioning profile for '%@'", identifier);
+                                                  RPVLog(@"Fetching new provisioning profile for '%@'", identifier);
 
                                                   [self _downloadTeamProvisioningProfileForAppIdId:appIdId
                                                                                         systemType:systemType
@@ -1146,7 +1147,7 @@ free_all:
 
 // Returns NO to the callback if no profile was deleted, YES if one was.
 - (void)_removeExistingProvisioningProfileForApplication:(NSString *)bundleIdentifier systemType:(EESystemType)systemType withCallback:(void (^)(NSError *))completionHandler {
-    NSLog(@"Revoking old provisioning profile for '%@' if possible", bundleIdentifier);
+    RPVLog(@"Revoking old provisioning profile for '%@' if possible", bundleIdentifier);
 
     NSString *_actualIdentifier = [NSString stringWithFormat:@"%@.%@", [[EEAppleServices sharedInstance] currentTeamID], bundleIdentifier];
 

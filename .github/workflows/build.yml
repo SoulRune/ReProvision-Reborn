@@ -61,7 +61,7 @@ jobs:
           xcodebuild \
             -workspace ReProvision.xcworkspace \
             -scheme iOS \
-            -configuration Release \
+            -configuration Debug \
             -sdk iphoneos \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO \
