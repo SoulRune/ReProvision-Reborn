@@ -44,6 +44,25 @@
 
 static RPVApplicationSigning *sharedInstance;
 
+static NSString *RPVOriginalIdentifierForApplication(RPVApplication *application, NSString *teamID) {
+    NSString *installed = [application bundleIdentifier];
+
+    NSString *appPath = [[application locationOfApplicationOnFilesystem] path];
+    if (appPath.length) {
+        NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[appPath stringByAppendingPathComponent:@"Info.plist"]];
+        NSString *alt = [info objectForKey:@"ALTBundleIdentifier"];
+        if (alt.length) return alt;
+        NSString *re = [info objectForKey:@"REBundleIdentifier"];
+        if (re.length) return re;
+    }
+
+    if (teamID.length && [installed hasSuffix:[@"." stringByAppendingString:teamID]]) {
+        return [installed substringToIndex:installed.length - teamID.length - 1];
+    }
+
+    return installed;
+}
+
 @implementation RPVApplicationSigning
 
 + (instancetype)sharedInstance {
@@ -239,7 +258,7 @@ static RPVApplicationSigning *sharedInstance;
             [[NSFileManager defaultManager] removeItemAtPath:[application locationOfApplicationOnFilesystem].path error:&cacheClearError];
 
             if (cacheClearError) {
-                NSLog(@"Failed to remove '%@'", [application locationOfApplicationOnFilesystem].path);
+                RPVLog(@"Failed to remove '%@'", [application locationOfApplicationOnFilesystem].path);
             }
         } else {
             if (error) {
@@ -339,7 +358,7 @@ static RPVApplicationSigning *sharedInstance;
         }
     }
 
-    NSLog(@"*** [ReProvision] profile register report:\n%@", report);
+    RPVLog(@"*** [ReProvision] profile register report:\n%@", report);
 
     return success;
 }
@@ -353,13 +372,14 @@ static RPVApplicationSigning *sharedInstance;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSError *error;
         NSDictionary *options = @{ @"CFBundleIdentifier": bundleIdentifier, @"AllowInstallLocalProvisioned": [NSNumber numberWithBool:YES] };
+        RPVLog(@"Installing IPA '%@' as '%@'", ipaPath, bundleIdentifier);
 
         NSURL *ipaURL = [NSURL fileURLWithPath:ipaPath];
 
         // Make a cached version of the .ipa for if we need to handle another go-around.
         [[NSFileManager defaultManager] copyItemAtPath:ipaPath toPath:[ipaPath stringByReplacingOccurrencesOfString:@".ipa" withString:@"2.ipa"] error:nil];
 
-        NSLog(@"Does ipaPath exist? %d", [[NSFileManager defaultManager] fileExistsAtPath:ipaPath]);
+        RPVLog(@"Does ipaPath exist? %d", [[NSFileManager defaultManager] fileExistsAtPath:ipaPath]);
 
         BOOL result = NO;
         @try {
@@ -383,7 +403,7 @@ static RPVApplicationSigning *sharedInstance;
                         [observer applicationSigningUpdateProgress:75 forBundleIdentifier:displayBundleIdentifier];
                     }
 
-                    NSLog(@"*** Uninstalled application, trying again.");
+                    RPVLog(@"*** Uninstalled application, trying again.");
                     [self _installIpaAtPath:[ipaPath stringByReplacingOccurrencesOfString:@".ipa" withString:@"2.ipa"] withBundleIdentifier:bundleIdentifier displayBundleIdentifier:displayBundleIdentifier];
 
                     return;
@@ -409,12 +429,14 @@ static RPVApplicationSigning *sharedInstance;
             // code 13 - which hid the real reason, so we just surface the truth.)
             NSString *errorMessage = fullError;
 
-            NSLog(@"*** [ReProvision] install failed: domain=%@ code=%ld desc=%@ userInfo=%@", error.domain, (long)error.code, error.localizedDescription, error.userInfo);
+            RPVLog(@"*** [ReProvision] install failed: domain=%@ code=%ld desc=%@ userInfo=%@", error.domain, (long)error.code, error.localizedDescription, error.userInfo);
 
             NSError *err = [self _errorFromString:errorMessage errorCode:RPVErrorFailedToInstallSignedIPA];
             for (id<RPVApplicationSigningProtocol> observer in [self.observers reverseObjectEnumerator]) {
                 [observer applicationSigningDidEncounterError:err forBundleIdentifier:displayBundleIdentifier];
             }
+
+            [RPVLogger endSessionSuccess:NO message:errorMessage];
         }
 
         if (result) {
@@ -433,6 +455,8 @@ static RPVApplicationSigning *sharedInstance;
             for (id<RPVApplicationSigningProtocol> observer in [self.observers reverseObjectEnumerator]) {
                 [observer applicationSigningUpdateProgress:100 forBundleIdentifier:displayBundleIdentifier];
             }
+
+            [RPVLogger endSessionSuccess:YES message:[NSString stringWithFormat:@"Installed as %@", bundleIdentifier]];
         }
 
         // If this was the last application, notify the completionHandler of success
@@ -450,6 +474,11 @@ static RPVApplicationSigning *sharedInstance;
 }
 
 - (void)_resignApplication:(RPVApplication *)application withTeamID:(NSString *)teamID username:(NSString *)username password:(NSString *)password {
+    [RPVLogger beginSessionForBundle:RPVOriginalIdentifierForApplication(application, teamID)
+                         displayName:[application applicationName]];
+    RPVLog(@"Installed identifier: %@ | version %@", [application bundleIdentifier], [application applicationVersion]);
+    [RPVLogger logStage:@"COPYING BUNDLE"];
+
     // Update progress to 10% for this application.
     for (id<RPVApplicationSigningProtocol> observer in [self.observers reverseObjectEnumerator]) {
         [observer applicationSigningUpdateProgress:10 forBundleIdentifier:[application bundleIdentifier]];
@@ -464,6 +493,8 @@ static RPVApplicationSigning *sharedInstance;
     NSError *error;
 
     if (![self _copyApplicationBundleForApplication:application extractedArchiveURL:&extractedArchiveURL applicationBundleURL:&applicationBundleURL error:&error]) {
+        [RPVLogger endSessionSuccess:NO message:[NSString stringWithFormat:@"Could not copy application bundle: %@", error.localizedDescription]];
+
         // Callback to say we done "goofed".
         for (id<RPVApplicationSigningProtocol> observer in [self.observers reverseObjectEnumerator]) {
             [observer applicationSigningDidEncounterError:error forBundleIdentifier:[application bundleIdentifier]];
@@ -544,6 +575,8 @@ static RPVApplicationSigning *sharedInstance;
 
         NSError *err;
         if (![EEBackend repackIpaAtPath:[extractedArchiveURL path] toPath:outputIpaPath error:&err]) {
+            [RPVLogger endSessionSuccess:NO message:[NSString stringWithFormat:@"Could not build IPA: %@", err.localizedDescription]];
+
             // Callback to say we done "goofed".
             for (id<RPVApplicationSigningProtocol> observer in [self.observers reverseObjectEnumerator]) {
                 [observer applicationSigningDidEncounterError:error forBundleIdentifier:[application bundleIdentifier]];
@@ -594,7 +627,7 @@ static RPVApplicationSigning *sharedInstance;
         if ([signedBundleIdentifier length] > 0) {
             bundleIdentifier = signedBundleIdentifier;
         }
-        NSLog(@"*** [ReProvision] installing with bundle id '%@' (original '%@')", bundleIdentifier, [application bundleIdentifier]);
+        RPVLog(@"*** [ReProvision] installing with bundle id '%@' (original '%@')", bundleIdentifier, [application bundleIdentifier]);
 
         // Register the freshly-signed provisioning profile with the system so iOS
         // trusts the signed app (misagent/MCProfileConnection). Without this the OS
@@ -602,7 +635,7 @@ static RPVApplicationSigning *sharedInstance;
         NSString *embeddedPath = [[applicationBundleURL path] stringByAppendingPathComponent:@"embedded.mobileprovision"];
         if ([[NSFileManager defaultManager] fileExistsAtPath:embeddedPath]) {
             BOOL registered = [self _registerProvisioningProfileAtPath:embeddedPath];
-            NSLog(@"*** [ReProvision] provisioning profile registered with system: %d", registered);
+            RPVLog(@"*** [ReProvision] provisioning profile registered with system: %d", registered);
         }
 
         // Start the next application off at this point for some parallelism!
@@ -618,6 +651,7 @@ static RPVApplicationSigning *sharedInstance;
 
         // And now we install! Install under the signed id, but report progress
         // under the original id that the UI is tracking.
+        [RPVLogger logStage:@"INSTALLING"];
         [self _installIpaAtPath:outputIpaPath withBundleIdentifier:bundleIdentifier displayBundleIdentifier:[application bundleIdentifier]];
     }];
 }

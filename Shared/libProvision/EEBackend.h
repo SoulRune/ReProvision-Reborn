@@ -88,19 +88,28 @@
 /// Enable/disable file logging. Persists to NSUserDefaults.
 + (void)setEnabled:(BOOL)enabled;
 
-/// Absolute path of the current log file. Valid even when logging is disabled.
+/// Directory holding the per-application log files.
++ (NSString *)logDirectory;
+
+/// Log file for a specific application, by its ORIGINAL bundle identifier.
++ (NSString *)logFilePathForBundle:(NSString *)bundleIdentifier;
+
+/// Log file for the session currently in progress (or the general log if none).
 + (NSString *)logFilePath;
 
-/// Absolute path of the rotated (previous) log file.
+/// Rotated file for the session currently in progress.
 + (NSString *)previousLogFilePath;
 
-/// Current log size in bytes (0 if no log exists).
+/// Every .log file in the log directory, sorted by name.
++ (NSArray<NSString *> *)logFiles;
+
+/// Combined size of all log files, in bytes.
 + (unsigned long long)logFileSize;
 
-/// Contents of previous + current log, oldest first. Nil if nothing logged yet.
+/// Contents of every log file, each preceded by its filename. Nil if nothing logged.
 + (NSString *)logContents;
 
-/// Delete both current and rotated logs.
+/// Delete all log files.
 + (void)clearLog;
 
 /// Write a line. No-op when disabled. Safe to call from any thread or queue.
@@ -109,10 +118,16 @@
 /// Write a line without formatting. Still redacted.
 + (void)logRaw:(NSString *)message;
 
-/// Mark the start of a signing run — writes a banner with device/app context.
+/// Begin a session. Routes all subsequent lines to this application's log file, and
+/// writes a banner with device/app context. `bundleIdentifier` should be the ORIGINAL
+/// identifier (no Team ID suffix) so the filename stays stable across re-signs.
 + (void)beginSessionForBundle:(NSString *)bundleIdentifier;
++ (void)beginSessionForBundle:(NSString *)bundleIdentifier displayName:(NSString *)displayName;
 
-/// Mark the end of a signing run.
+/// Write a stage marker, e.g. "SIGNING" / "INSTALLING". Written synchronously.
++ (void)logStage:(NSString *)stage;
+
+/// End the current session and stop routing to its file.
 + (void)endSessionSuccess:(BOOL)success message:(NSString *)message;
 
 @end

@@ -128,7 +128,7 @@
 
     // --- Signing log ---------------------------------------------------------
     PSSpecifier *logGroup = [PSSpecifier groupSpecifierWithName:@"Signing Log"];
-    [logGroup setProperty:@"Writes the full signing process to a file, so a failure can be inspected afterwards instead of needing a syslog capture at the moment it happens.\n\nApple ID addresses, tokens and private keys are redacted, but review the log before sharing it." forKey:@"footerText"];
+    [logGroup setProperty:@"Writes the full signing and installation process to a file per application, so a failure can be inspected afterwards instead of needing a syslog capture at the moment it happens.\n\nApple ID addresses, tokens and private keys are redacted, but review the log before sharing it." forKey:@"footerText"];
     [array addObject:logGroup];
 
     PSSpecifier *logToggle = [PSSpecifier preferenceSpecifierNamed:@"Log Signing to File" target:self set:@selector(setPreferenceValue:specifier:) get:@selector(readPreferenceValue:) detail:nil cell:PSSwitchCell edit:nil];
@@ -147,8 +147,18 @@
     } else {
         sizeTitle = [NSString stringWithFormat:@"Log Size: %.1f MB", logBytes / (1024.0 * 1024.0)];
     }
+    NSUInteger fileCount = [[RPVLogger logFiles] count];
+    if (fileCount > 0) {
+        sizeTitle = [NSString stringWithFormat:@"%@ in %lu file%@", sizeTitle, (unsigned long)fileCount, fileCount == 1 ? @"" : @"s"];
+    }
     PSSpecifier *logSize = [PSSpecifier preferenceSpecifierNamed:sizeTitle target:self set:nil get:nil detail:nil cell:PSStaticTextCell edit:nil];
     [array addObject:logSize];
+
+    // Show where they actually landed - the logger falls back to the app container if
+    // the preferred directory isn't writable, so a hardcoded path here would lie.
+    PSSpecifier *logPath = [PSSpecifier preferenceSpecifierNamed:[RPVLogger logDirectory]
+                                                          target:self set:nil get:nil detail:nil cell:PSStaticTextCell edit:nil];
+    [array addObject:logPath];
 
     PSSpecifier *shareLog = [PSSpecifier preferenceSpecifierNamed:@"Share Log" target:self set:nil get:nil detail:nil cell:PSButtonCell edit:nil];
     shareLog->action = @selector(shareSigningLog:);
@@ -175,8 +185,14 @@
 
     // Share the file itself rather than a string, so it arrives with a filename and can
     // be attached to a bug report directly.
-    NSURL *url = [NSURL fileURLWithPath:[RPVLogger logFilePath]];
-    UIActivityViewController *share = [[UIActivityViewController alloc] initWithActivityItems:@[url]
+    // Share every per-application log file, not just one - a problem often involves
+    // several apps, and the user shouldn't have to export them one at a time.
+    NSMutableArray *items = [NSMutableArray array];
+    for (NSString *path in [RPVLogger logFiles]) {
+        [items addObject:[NSURL fileURLWithPath:path]];
+    }
+
+    UIActivityViewController *share = [[UIActivityViewController alloc] initWithActivityItems:items
                                                                         applicationActivities:nil];
 
     // iPad requires a popover anchor here or this throws.
