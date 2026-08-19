@@ -22,6 +22,34 @@
 
 @implementation EEBackend
 
+// Returns the bundle's ORIGINAL identifier
+static NSString *RPVOriginalBundleIDFromInfoPlist(NSDictionary *infoplist) {
+    NSString *alt = [infoplist objectForKey:@"ALTBundleIdentifier"];
+    if (alt.length) return alt;
+    NSString *re = [infoplist objectForKey:@"REBundleIdentifier"];
+    if (re.length) return re;
+    return [infoplist objectForKey:@"CFBundleIdentifier"];
+}
+
+// Compute the re-signed bundle identifier.
+// For a TOP-LEVEL app this is simply "<original>.<teamId>".
+// For a NESTED bundle (an .appex in PlugIns, a watch app in Watch) it must NOT be
+// "<originalChild>.<teamId>", because installd enforces that an app extension's
+// identifier is prefixed by its host app's identifier
+static NSString *RPVComputeNewBundleID(NSString *originalId, NSString *parentOriginalId, NSString *parentNewId, NSString *teamId) {
+    if (!originalId.length) return originalId;
+
+    if (parentOriginalId.length && parentNewId.length) {
+        NSString *prefix = [parentOriginalId stringByAppendingString:@"."];
+        if ([originalId hasPrefix:prefix]) {
+            NSString *suffix = [originalId substringFromIndex:prefix.length];
+            return [NSString stringWithFormat:@"%@.%@", parentNewId, suffix];
+        }
+    }
+
+    return [originalId stringByAppendingFormat:@".%@", teamId];
+}
+
 + (void)provisionDevice:(NSString *)udid name:(NSString *)name identity:(NSString *)identity gsToken:(NSString *)gsToken priorChosenTeamID:(NSString *)teamId systemType:(EESystemType)systemType withCallback:(void (^)(NSError *))completionHandler {
     EEProvisioning *provisioner = [EEProvisioning provisionerWithCredentials:identity:gsToken];
     [provisioner provisionDevice:udid name:name withTeamIDCheck:^NSString *(NSArray *teams) {
@@ -49,11 +77,34 @@
 }
 
 + (void)signBundleAtPath:(NSString *)path identity:(NSString *)identity gsToken:(NSString *)gsToken priorChosenTeamID:(NSString *)teamId withCompletionHandler:(void (^)(NSError *error))completionHandler {
+    // Public entrypoint — this is a top-level bundle, so it has no parent.
+    [self signBundleAtPath:path
+                  identity:identity
+                   gsToken:gsToken
+         priorChosenTeamID:teamId
+    parentOriginalBundleID:nil
+         parentNewBundleID:nil
+     withCompletionHandler:completionHandler];
+}
+
++ (void)signBundleAtPath:(NSString *)path identity:(NSString *)identity gsToken:(NSString *)gsToken priorChosenTeamID:(NSString *)teamId parentOriginalBundleID:(NSString *)parentOriginalBundleID parentNewBundleID:(NSString *)parentNewBundleID withCompletionHandler:(void (^)(NSError *error))completionHandler {
     // We need to handle application extensions, e.g. watchOS applications and VPN plugins etc.
     // These are stored in the bundle's root directory at the following locations:
     // - /Plugins
     // - /Watch
     // Therefore, recurse through those directories as required before continuing for the root directory.
+
+    // Work out THIS bundle's original and new identifiers up front, so we can pass them
+    // to nested bundles before they're signed. installd requires an app extension's
+    // identifier to be prefixed by its host app's identifier, so children must be renamed
+    // relative to our new id — not independently given a ".<teamId>" suffix.
+    NSString *myOriginalBundleID = nil;
+    NSString *myNewBundleID = nil;
+    {
+        NSDictionary *earlyInfoPlist = [NSDictionary dictionaryWithContentsOfFile:[NSString stringWithFormat:@"%@/Info.plist", path]];
+        myOriginalBundleID = RPVOriginalBundleIDFromInfoPlist(earlyInfoPlist);
+        myNewBundleID = RPVComputeNewBundleID(myOriginalBundleID, parentOriginalBundleID, parentNewBundleID, teamId);
+    }
 
     dispatch_group_t dispatch_group = dispatch_group_create();
     NSMutableArray *__block subBundleErrors = [NSMutableArray array];
@@ -70,7 +121,7 @@
             NSLog(@"Handling sub-bundle: %@", subBundlePath);
 
             // Sign the bundle
-            [self signBundleAtPath:subBundlePath identity:identity gsToken:gsToken priorChosenTeamID:teamId withCompletionHandler:^(NSError *error) {
+            [self signBundleAtPath:subBundlePath identity:identity gsToken:gsToken priorChosenTeamID:teamId parentOriginalBundleID:myOriginalBundleID parentNewBundleID:myNewBundleID withCompletionHandler:^(NSError *error) {
                 if (error)
                     [subBundleErrors addObject:error];
 
@@ -92,7 +143,7 @@
             NSLog(@"Handling sub-bundle: %@", subBundlePath);
 
             // Sign the bundle
-            [self signBundleAtPath:subBundlePath identity:identity gsToken:gsToken priorChosenTeamID:teamId withCompletionHandler:^(NSError *error) {
+            [self signBundleAtPath:subBundlePath identity:identity gsToken:gsToken priorChosenTeamID:teamId parentOriginalBundleID:myOriginalBundleID parentNewBundleID:myNewBundleID withCompletionHandler:^(NSError *error) {
                 if (error)
                     [subBundleErrors addObject:error];
 
@@ -178,8 +229,19 @@
     else
         [infoplist setObject:applicationId forKey:@"REBundleIdentifier"];
 
-    applicationId = [applicationId stringByAppendingFormat:@".%@", teamId];
+    applicationId = RPVComputeNewBundleID(applicationId, parentOriginalBundleID, parentNewBundleID, teamId);
+    NSLog(@"[ReProvision] Bundle ID: %@ -> %@ (parent: %@ -> %@)",
+          [infoplist objectForKey:@"REBundleIdentifier"] ?: @"(none)", applicationId,
+          parentOriginalBundleID ?: @"(top-level)", parentNewBundleID ?: @"(top-level)");
     [infoplist setObject:applicationId forKey:@"CFBundleIdentifier"];
+
+    // A watchOS app points at its host via WKCompanionAppBundleIdentifier. Since the
+    // host's identifier just changed, this has to follow it or the watch app is rejected.
+    NSString *companion = [infoplist objectForKey:@"WKCompanionAppBundleIdentifier"];
+    if (companion.length && parentNewBundleID.length) {
+        [infoplist setObject:parentNewBundleID forKey:@"WKCompanionAppBundleIdentifier"];
+        NSLog(@"[ReProvision] WKCompanionAppBundleIdentifier: %@ -> %@", companion, parentNewBundleID);
+    }
 
     NSError *error = nil;
     if (@available(iOS 11.0, *)) {

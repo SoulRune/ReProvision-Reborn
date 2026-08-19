@@ -27,6 +27,7 @@
 #include <memory>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -1988,7 +1989,8 @@ Hash Sign(const void *idata, size_t isize, std::streambuf &output, const std::st
 #endif
 
     // XXX: this is just a "sufficiently large number"
-    size_t certificate(0x3000);
+    // 0x3000 (12KB) is too small for iOS 15+ signing, so changed
+    size_t certificate(0x10000);
 
     Allocate(idata, isize, output, fun([&](const MachHeader &mach_header, size_t size) -> size_t {
         size_t alloc(sizeof(struct SuperBlob));
@@ -2320,8 +2322,24 @@ bool DiskFolder::Look(const std::string &path) const {
 
 void DiskFolder::Open(const std::string &path, const Functor<void (std::streambuf &, size_t, const void *)> &code) const {
     std::filebuf data;
-    auto result(data.open(Path(path).c_str(), std::ios::binary | std::ios::in));
-    _assert_(result == &data, "DiskFolder::Open(%s)", path.c_str());
+    auto full(Path(path));
+    errno = 0;
+    auto result(data.open(full.c_str(), std::ios::binary | std::ios::in));
+    if (result != &data) {
+        // The stock _assert_ macro sends the useful detail (the path) to stderr,
+        // which is invisible on iOS - the thrown string is just the bare expression.
+        // Throw a std::exception carrying the path + errno so the ObjC layer's
+        // catch(const std::exception&) can surface it in the log / UI.
+        int err = errno;
+        std::string msg("DiskFolder::Open failed: ");
+        msg += full;
+        msg += " (errno=";
+        msg += std::to_string(err);
+        msg += ": ";
+        msg += strerror(err);
+        msg += ")";
+        throw std::runtime_error(msg);
+    }
 
     auto length(data.pubseekoff(0, std::ios::end, std::ios::in));
     data.pubseekpos(0, std::ios::in);
@@ -2644,9 +2662,12 @@ Bundle Sign(const std::string &root, Folder &folder, const std::string &key, std
     folder.Find("", fun([&](const std::string &name) {
         if (!nested(name))
             return;
-        auto bundle(root + Split(name).dir);
-        bundle.resize(bundle.size() - resources.size());
-        SubFolder subfolder(folder, bundle);
+
+        auto relative(Split(name).dir);
+        relative.resize(relative.size() - resources.size());
+
+        auto bundle(root + relative);
+        SubFolder subfolder(folder, relative);
 
         // Run EVERY nested bundle (Frameworks too, not just PlugIns) through the
         // caller's alter callback. ldid originally passed framework entitlements

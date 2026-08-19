@@ -26,6 +26,11 @@ static auto dummy([](double) {});
 // private/jailbreak entitlements like platform-application / run-unsigned-code /
 // com.apple.private.* - is stripped, otherwise installd rejects the app (0xe8008001)
 // or it gets killed right after launch.
+//
+// IMPORTANT: `bundlePath` must be the bundle that OWNS the embedded.mobileprovision
+// we want to consult. For the main app that's the .app root; for an app extension
+// that's the .appex root (which has its own provisioning profile with its own
+// distinct set of allowed entitlements - e.g. app-groups for a widget).
 static NSSet *RPVAllowedEntitlementKeys(NSString *bundlePath) {
     NSMutableSet *allowed = [NSMutableSet setWithObjects:
         @"application-identifier",
@@ -49,6 +54,20 @@ static NSSet *RPVAllowedEntitlementKeys(NSString *bundlePath) {
     }
 
     return allowed;
+}
+
+// Given a path RELATIVE to the main bundle root (as passed to the ldid alter callback
+// for a nested Mach-O), find the enclosing .appex bundle root, if any. ldid passes
+// paths like "PlugIns/AltWidgetExtension.appex/AltWidgetExtension" for extension
+// executables and "Frameworks/Foo.framework/Foo" for frameworks; only care about
+// .appex (frameworks have no entitlements anyway).
+static NSString *RPVEnclosingAppexPath(NSString *mainBundleAbsPath, const std::string &relPath) {
+    if (relPath.empty()) return nil;
+    NSString *rel = [NSString stringWithUTF8String:relPath.c_str()];
+    NSRange r = [rel rangeOfString:@".appex/"];
+    if (r.location == NSNotFound) return nil;
+    NSString *appexRel = [rel substringToIndex:r.location + r.length - 1]; // drop trailing '/'
+    return [mainBundleAbsPath stringByAppendingPathComponent:appexRel];
 }
 
 // Strip entitlements not in `allowed` from an XML entitlements string (used for
@@ -81,6 +100,16 @@ static std::string RPVSanitizeEntitlementsXML(const std::string &xml, NSSet *all
     return std::string((const char *)out.bytes, out.length);
 }
 
+// Private methods - declared here so the compiler sees the new selectors
+// (added by the rootless / iOS 15+ fix set) before their first use in this file.
+@interface EESigning ()
+- (STACK_OF(X509) *)_loadCAChainStackFromDiskForCertificate:(NSData *)certificate;
+- (X509 *)_loadCAChainFromDiskForCertificate:(NSData *)certificate;
+- (std::string)_createPKCS12CertificateWithKey:(NSString *)key certificate:(NSData *)certificate andCAChain:(X509 *)chain;
+- (std::string)_createPKCS12CertificateWithKey:(NSString *)key certificate:(NSData *)certificate andCAChainStack:(STACK_OF(X509) *)chainStack;
+- (std::string)_createRequirementsBlobWithKey:(NSString *)key certificate:(NSData *)certificate andBundleIdentifier:(NSString *)identifier;
+@end
+
 @implementation EESigning
 
 + (instancetype)signerWithCertificate:(NSData *)certificate privateKey:(NSString *)privateKey {
@@ -94,16 +123,14 @@ static std::string RPVSanitizeEntitlementsXML(const std::string &xml, NSSet *all
         _certificate = certificate;
         _privateKey = privateKey;
 
-        // Create a PKCS12 certificate from the private key and certificate. This is what ldid
-        // accepts in Sign().
-        // Effecctively, we're doing:
-        // openssl pkcs12 -inkey key.pem -in certificate.pem -export -out certificate.p12 -CAfile caChain.pem -chain
-        // Where key.pem == privateKey, certificate.pem == certificate, caChain.pem == apple-ios.pem
-
-        // Create our PKCS12!
-        _PKCS12 = [self _createPKCS12CertificateWithKey:privateKey certificate:certificate andCAChain:[self _loadCAChainFromDiskForCertificate:certificate]];
+        // Create a PKCS12 certificate from the private key and certificate.
+		// This is what ldid accepts in Sign().
+        STACK_OF(X509) *chain = [self _loadCAChainStackFromDiskForCertificate:certificate];
+        _PKCS12 = [self _createPKCS12CertificateWithKey:privateKey
+                                            certificate:certificate
+                                          andCAChainStack:chain];
         if (_PKCS12.size() == 0) {
-            // Holy moly Batman.
+            NSLog(@"*** [ReProvision] PKCS12 creation returned empty - signing will fail");
         }
     }
 
@@ -169,10 +196,10 @@ static std::string RPVSanitizeEntitlementsXML(const std::string &xml, NSSet *all
     // ...) before signing the MAIN executable - otherwise installd rejects the app
     // (0xe8008001) or it's killed right after launch. The allowed set is derived from
     // the actual provisioning profile, so it's as complete as the account permits.
-    NSSet *allowedEntitlementKeys = RPVAllowedEntitlementKeys(absolutePath);
+    NSSet *mainAllowedKeys = RPVAllowedEntitlementKeys(absolutePath);
     NSMutableDictionary *cleanEntitlements = [entitlements mutableCopy] ?: [NSMutableDictionary dictionary];
     for (NSString *key in [cleanEntitlements allKeys]) {
-        if (![allowedEntitlementKeys containsObject:key]) {
+        if (![mainAllowedKeys containsObject:key]) {
             NSLog(@"*** [ReProvision] stripping unsupported entitlement: %@", key);
             [cleanEntitlements removeObjectForKey:key];
         }
@@ -180,6 +207,12 @@ static std::string RPVSanitizeEntitlementsXML(const std::string &xml, NSSet *all
 
     NSError *error;
     NSMutableData *exportedPlist = [[NSPropertyListSerialization dataWithPropertyList:cleanEntitlements format:NSPropertyListXMLFormat_v1_0 options:0 error:&error] mutableCopy];
+    if (!exportedPlist) {
+        NSString *reason = [NSString stringWithFormat:@"Failed to serialize entitlements: %@", error.localizedDescription ?: @"unknown"];
+        NSLog(@"*** [ReProvision] %@", reason);
+        completionHandler(NO, reason);
+        return;
+    }
     [exportedPlist appendBytes:"\x0" length:1];
 
     std::string entitlementsString = (char *)[exportedPlist bytes];
@@ -190,211 +223,296 @@ static std::string RPVSanitizeEntitlementsXML(const std::string &xml, NSSet *all
 
     // We can now sign!
 
-    ldid::DiskFolder folder([[absolutePath copy] cStringUsingEncoding:NSUTF8StringEncoding]);
+    NSString *mainBundleAbsPath = [absolutePath copy];
+    ldid::DiskFolder folder([mainBundleAbsPath cStringUsingEncoding:NSUTF8StringEncoding]);
+
     // The alter callback runs for every Mach-O in the bundle. ldid passes the
     // component's path prefix as the first argument: "" for the main executable, and
     // the relative path (e.g. "Frameworks/Foo.framework/") for nested code. The main
     // executable gets the (sanitized) app entitlements; nested code keeps its own with
-    // anything the profile doesn't grant stripped.
-    ldid::Bundle outputBundle = Sign("", folder, _PKCS12, requirementsString, ldid::fun([&](const std::string &path, const std::string &original) -> std::string {
-        std::string result;
-        if (path.empty()) {
-            // Main executable: gets the (sanitized) app entitlements.
-            result = entitlementsString;
-        } else if (path.find(".appex") != std::string::npos) {
-            // App extension: needs its own entitlements, just sanitized.
-            result = RPVSanitizeEntitlementsXML(original, allowedEntitlementKeys);
-        } else {
-            // Frameworks / dylibs: NO entitlements at all. Properly-built apps ship
-            // frameworks with no entitlements blob; leaving one here (even just
-            // get-task-allow) makes installd reject the whole bundle (0xe8008001).
-            result = "";
-        }
-        return result;
-    }), ldid::fun([&](const std::string &) {}), ldid::fun(dummy));
-
-    // TODO: Handle errors!
+    // anything the OWNING sub-bundle's profile doesn't grant stripped.
+    try {
+        ldid::Bundle outputBundle = Sign("", folder, _PKCS12, requirementsString,
+            ldid::fun([&](const std::string &path, const std::string &original) -> std::string {
+                std::string result;
+                if (path.empty()) {
+                    // Main executable: gets the (sanitized) app entitlements.
+                    result = entitlementsString;
+                } else if (path.find(".appex") != std::string::npos) {
+                    // App extension: use its OWN profile's allowed keys, not the main app's.
+                    NSString *appexPath = RPVEnclosingAppexPath(mainBundleAbsPath, path);
+                    NSSet *appexAllowed = appexPath ? RPVAllowedEntitlementKeys(appexPath) : mainAllowedKeys;
+                    result = RPVSanitizeEntitlementsXML(original, appexAllowed);
+                } else {
+                    // Frameworks / dylibs: NO entitlements at all. Properly-built apps ship
+                    // frameworks with no entitlements blob; leaving one here (even just
+                    // get-task-allow) makes installd reject the whole bundle (0xe8008001).
+                    result = "";
+                }
+                return result;
+            }),
+            ldid::fun([&](const std::string &) {}),
+            ldid::fun(dummy));
+    } catch (const char *msg) {
+        NSString *reason = [NSString stringWithUTF8String:msg ? msg : "ldid: unknown assertion"];
+        NSLog(@"*** [ReProvision] ldid threw: %@", reason);
+        completionHandler(NO, [NSString stringWithFormat:@"Signing failed: %@", reason]);
+        return;
+    } catch (const std::exception &ex) {
+        NSString *reason = [NSString stringWithUTF8String:ex.what()];
+        NSLog(@"*** [ReProvision] ldid std::exception: %@", reason);
+        completionHandler(NO, [NSString stringWithFormat:@"Signing failed: %@", reason]);
+        return;
+    } catch (...) {
+        NSLog(@"*** [ReProvision] ldid unknown C++ exception");
+        completionHandler(NO, @"Signing failed: unknown internal error");
+        return;
+    }
 
     completionHandler(YES, @"");
 }
 
-- (X509 *)_loadCAChainFromDiskForCertificate:(NSData *)certificate {
-    X509 *certForHashCheck;
-    const unsigned char *input = (unsigned char *)[certificate bytes];
-    certForHashCheck = d2i_X509(NULL, &input, (int)[certificate length]);
-    if (!certForHashCheck) {
-        NSLog(@"Error loading cert into memory.");
-        @throw [NSException exceptionWithName:@"libProvisionSigningException" reason:@"Could not load certificate into memory!" userInfo:nil];
-    }
-
-    unsigned long issuerHash = X509_issuer_name_hash(certForHashCheck);
-
-    NSString *filepath;
-    if (issuerHash == 0x817d2f7a) {
-        filepath = [[NSBundle mainBundle] pathForResource:@"apple-ios" ofType:@"pem"];
-    } else if (issuerHash == 0x9b16b75c) {
-        filepath = [[NSBundle mainBundle] pathForResource:@"apple-ios-g3" ofType:@"pem"];
-    } else {
-        NSLog(@"Failed to determine intermediate certificate to use.");
-        @throw [NSException exceptionWithName:@"libProvisionSigningException" reason:@"Could not determine intermediate certificate to use!" userInfo:nil];
-    }
-
-    X509_free(certForHashCheck);
-
-    NSLog(@"Loading CA chain from '%@'", filepath);
-
+// Load ALL X.509 certificates from a PEM file into `outStack`.
+// Returns the count loaded. Skips duplicates by subject-key-id when possible.
+static int RPVLoadAllCertsFromPEM(NSString *filepath, STACK_OF(X509) *outStack) {
+    if (!filepath) return 0;
     NSString *contents = [NSString stringWithContentsOfFile:filepath encoding:NSUTF8StringEncoding error:nil];
+    if (!contents.length) return 0;
 
     BIO *bio = BIO_new(BIO_s_mem());
     BIO_puts(bio, [contents cStringUsingEncoding:NSUTF8StringEncoding]);
 
-    X509 *cert = PEM_read_bio_X509(bio, NULL, NULL, NULL);
-    if (!cert) {
-        NSLog(@"Failed to load CA chain.");
-        @throw [NSException exceptionWithName:@"libProvisionSigningException" reason:@"Could not load CA chain from disk!" userInfo:nil];
+    int n = 0;
+    X509 *c;
+    while ((c = PEM_read_bio_X509(bio, NULL, NULL, NULL)) != NULL) {
+        sk_X509_push(outStack, c);
+        n++;
     }
-
-    return cert;
+    BIO_free_all(bio);
+    return n;
 }
 
-- (std::string)_createPKCS12CertificateWithKey:(NSString *)key certificate:(NSData *)certificate andCAChain:(X509 *)chain {
+// Load the intermediate CA chain that signs the developer certificate.
+// New behaviour: try the hash-matched PEM first (fast path), but on miss/parse failure
+// fall through to ALL bundled PEMs and return every X.509 we can find. The returned
+// stack is owned by the caller (sk_X509_pop_free with X509_free).
+- (STACK_OF(X509) *)_loadCAChainStackFromDiskForCertificate:(NSData *)certificate {
+    STACK_OF(X509) *stack = sk_X509_new_null();
+
+    // Peek at the issuer hash to prefer a known-good PEM if we recognize it.
+    NSString *preferred = nil;
+    const unsigned char *input = (unsigned char *)[certificate bytes];
+    X509 *certForHashCheck = d2i_X509(NULL, &input, (int)[certificate length]);
+    if (certForHashCheck) {
+        unsigned long issuerHash = X509_issuer_name_hash(certForHashCheck);
+        if (issuerHash == 0x817d2f7a) {
+            preferred = [[NSBundle mainBundle] pathForResource:@"apple-ios" ofType:@"pem"];
+        } else if (issuerHash == 0x9b16b75c) {
+            preferred = [[NSBundle mainBundle] pathForResource:@"apple-ios-g3" ofType:@"pem"];
+        } else {
+            NSLog(@"*** [ReProvision] Unrecognized issuer hash 0x%lx - falling back to full PEM search", issuerHash);
+        }
+        X509_free(certForHashCheck);
+    }
+
+    // Try preferred first
+    if (preferred) {
+        NSLog(@"Loading CA chain from '%@'", preferred);
+        RPVLoadAllCertsFromPEM(preferred, stack);
+    }
+
+    // Then union with the rest of the bundled intermediates. Duplicates in the CMS
+    // don't matter - CMS_add1_cert is a no-op if a cert is already present.
+    NSArray *fallbacks = @[ @"apple-ios-g3", @"apple-ios" ];
+    for (NSString *name in fallbacks) {
+        NSString *p = [[NSBundle mainBundle] pathForResource:name ofType:@"pem"];
+        if (p && ![p isEqualToString:preferred]) {
+            RPVLoadAllCertsFromPEM(p, stack);
+        }
+    }
+
+    if (sk_X509_num(stack) == 0) {
+        sk_X509_free(stack);
+        NSLog(@"Failed to load CA chain.");
+        @throw [NSException exceptionWithName:@"libProvisionSigningException"
+                                       reason:@"Could not load any CA intermediate from disk!"
+                                     userInfo:nil];
+    }
+
+    NSLog(@"Loaded %d intermediate certificate(s) into CA chain", sk_X509_num(stack));
+    return stack;
+}
+
+// Backwards-compat shim: some paths still expect a single X509*. Returns the first cert of the freshly-built stack,
+// and frees the rest. New code should call _loadCAChainStackFromDiskForCertificate:
+// directly and pass the whole stack to PKCS12_create.
+- (X509 *)_loadCAChainFromDiskForCertificate:(NSData *)certificate {
+    STACK_OF(X509) *stack = [self _loadCAChainStackFromDiskForCertificate:certificate];
+    X509 *first = sk_X509_shift(stack);              // take ownership of first
+    sk_X509_pop_free(stack, X509_free);              // free the rest
+    return first;
+}
+
+- (std::string)_createPKCS12CertificateWithKey:(NSString *)key certificate:(NSData *)certificate andCAChainStack:(STACK_OF(X509) *)chainStack {
+    // This function mirrors the original single-cert version as closely as possible,
+    // differing only in that it accepts multiple intermediate certificates. It also
+    // logs every OpenSSL failure it sees, so if PKCS12 comes back empty we can tell
+    // WHY from syslog instead of guessing.
+    //
+    // Ownership model (kept simple to avoid double-frees on OpenSSL 1.0.2):
+    //   - `chainStack` is CONSUMED. Callers must not use it after this call.
+    //   - `rootCA` is loaded here, pushed onto the CA stack, and freed with the stack.
+    //   - Intermediates from `chainStack` are MOVED (not ref-counted) onto the CA
+    //     stack; the original chainStack container is freed empty.
+    //   - PKCS12_free is called BEFORE the certs/keys it references are freed.
+
     // Load root CA
     NSString *rootCAFilepath = [[NSBundle mainBundle] pathForResource:@"root" ofType:@"pem"];
-
     NSString *rootCAContents = [NSString stringWithContentsOfFile:rootCAFilepath encoding:NSUTF8StringEncoding error:nil];
+    if (!rootCAContents.length) {
+        NSLog(@"*** [ReProvision] Failed to read root.pem from bundle (path=%@)", rootCAFilepath);
+        if (chainStack) sk_X509_pop_free(chainStack, X509_free);
+        return std::string("");
+    }
 
     BIO *rootCABio = BIO_new(BIO_s_mem());
     BIO_puts(rootCABio, [rootCAContents cStringUsingEncoding:NSUTF8StringEncoding]);
-
     X509 *rootCA = PEM_read_bio_X509(rootCABio, NULL, NULL, NULL);
     if (!rootCA) {
-        NSLog(@"Failed to load root CA.");
-        @throw [NSException exceptionWithName:@"libProvisionSigningException" reason:@"Could not load CA root from disk!" userInfo:nil];
+        NSLog(@"*** [ReProvision] PEM_read_bio_X509(root) failed. OpenSSL: %s",
+              ERR_error_string(ERR_get_error(), NULL));
+        BIO_free_all(rootCABio);
+        if (chainStack) sk_X509_pop_free(chainStack, X509_free);
+        return std::string("");
     }
 
-    // Code utilised from: http://fm4dd.com/openssl/pkcs12test.htm
-
-    X509 *cert, *cacert;
-    STACK_OF(X509) * cacertstack;
-    PKCS12 *pkcs12bundle;
-    EVP_PKEY *cert_privkey;
-    BIO *bio_privkey = NULL, *bio_certificate = NULL, *bio_pkcs12 = NULL;
+    // Locals - same layout as the original code
+    X509 *cert = NULL;
+    STACK_OF(X509) *cacertstack = NULL;
+    PKCS12 *pkcs12bundle = NULL;
+    EVP_PKEY *cert_privkey = NULL;
+    BIO *bio_privkey = NULL, *bio_pkcs12 = NULL;
     int bytes = 0;
     char *data = NULL;
     long len = 0;
     int error = 0;
 
-    /* ------------------------------------------------------------ *
-     * 1.) These function calls are essential to make PEM_read and  *
-     *     other openssl functions work.                            *
-     * ------------------------------------------------------------ */
     OpenSSL_add_all_algorithms();
     ERR_load_crypto_strings();
 
-    /*--------------------------------------------------------------*
-     * 2.) we load the certificates private key                     *
-     *    ( for this, it has no password )                     *
-     *--------------------------------------------------------------*/
-
+    // 1) Load the private key
     bio_privkey = BIO_new(BIO_s_mem());
     BIO_puts(bio_privkey, [key cStringUsingEncoding:NSUTF8StringEncoding]);
-
-    if (!(cert_privkey = PEM_read_bio_PrivateKey(bio_privkey, NULL, NULL, NULL))) {
-        NSLog(@"Error loading certificate private key content.");
+    cert_privkey = PEM_read_bio_PrivateKey(bio_privkey, NULL, NULL, NULL);
+    if (!cert_privkey) {
+        NSLog(@"*** [ReProvision] PEM_read_bio_PrivateKey failed. OpenSSL: %s",
+              ERR_error_string(ERR_get_error(), NULL));
         error = -1;
     }
 
-    /*--------------------------------------------------------------*
-     * 3.) we load the corresponding certificate                    *
-     *--------------------------------------------------------------*/
-
-    const unsigned char *input = (unsigned char *)[certificate bytes];
-    cert = d2i_X509(NULL, &input, (int)[certificate length]);
-    if (!cert) {
-        NSLog(@"Error loading cert into memory.");
-        error = -1;
+    // 2) Load the leaf developer certificate (DER)
+    if (error == 0) {
+        const unsigned char *input = (unsigned char *)[certificate bytes];
+        cert = d2i_X509(NULL, &input, (int)[certificate length]);
+        if (!cert) {
+            NSLog(@"*** [ReProvision] d2i_X509(leaf) failed. OpenSSL: %s",
+                  ERR_error_string(ERR_get_error(), NULL));
+            error = -1;
+        }
     }
 
-    /*--------------------------------------------------------------*
-     * 4.) we load the CA certificate who signed it                 *
-     *--------------------------------------------------------------*/
+    // 3) Build CA stack: root + every intermediate from chainStack.
+    //    We MOVE ownership from chainStack into cacertstack (no ref-counting needed),
+    //    then free chainStack as an empty container.
+    if (error == 0) {
+        cacertstack = sk_X509_new_null();
+        if (!cacertstack) {
+            NSLog(@"*** [ReProvision] sk_X509_new_null failed");
+            error = -1;
+        } else {
+            sk_X509_push(cacertstack, rootCA);
+            rootCA = NULL;  // ownership moved
 
-    cacert = chain;
-
-    /*--------------------------------------------------------------*
-     * 5.) we load the CA certificate on the stack                  *
-     *--------------------------------------------------------------*/
-
-    if ((cacertstack = sk_X509_new_null()) == NULL) {
-        NSLog(@"Error creating STACK_OF(X509) structure.");
-        error = -1;
+            if (chainStack) {
+                while (sk_X509_num(chainStack) > 0) {
+                    X509 *c = sk_X509_shift(chainStack);  // take ownership
+                    sk_X509_push(cacertstack, c);
+                }
+                sk_X509_free(chainStack);  // container empty - safe to just free
+                chainStack = NULL;
+            }
+            NSLog(@"[ReProvision] PKCS12: CA stack size=%d, have leaf=%d, have key=%d",
+                  sk_X509_num(cacertstack), cert != NULL, cert_privkey != NULL);
+        }
     }
 
-    sk_X509_push(cacertstack, rootCA);
-    sk_X509_push(cacertstack, cacert);
-
-    /*--------------------------------------------------------------*
-     * 6.) we create the PKCS12 structure and fill it with our data *
-     *--------------------------------------------------------------*/
-
-    if ((pkcs12bundle = PKCS12_new()) == NULL) {
-        NSLog(@"Error creating PKCS12 structure.");
-        error = -1;
+    // 4) Create the PKCS12 bundle
+    if (error == 0) {
+        pkcs12bundle = PKCS12_create(
+            (char *)"",
+            (char *)"ReProvision",
+            cert_privkey,
+            cert,
+            cacertstack,
+            0, 0, 0, 0, 0
+        );
+        if (!pkcs12bundle) {
+            NSLog(@"*** [ReProvision] PKCS12_create failed. OpenSSL: %s",
+                  ERR_error_string(ERR_get_error(), NULL));
+            // Drain the whole OpenSSL error queue too - PKCS12_create can push several
+            unsigned long e;
+            while ((e = ERR_get_error()) != 0) {
+                NSLog(@"*** [ReProvision]   further OpenSSL error: %s",
+                      ERR_error_string(e, NULL));
+            }
+            error = -1;
+        }
     }
 
-    /* values of zero use the openssl default values */
-    pkcs12bundle = PKCS12_create(
-        (char *)"",             // We give a password of "" here as ldid expects that
-        (char *)"ReProvision",  // friendly certname
-        cert_privkey,           // the certificate private key
-        cert,                   // the main certificate
-        cacertstack,            // stack of CA cert chain
-        0,                      // int nid_key (default 3DES)
-        0,                      // int nid_cert (40bitRC2)
-        0,                      // int iter (default 2048)
-        0,                      // int mac_iter (default 1)
-        0                       // int keytype (default no flag)
-    );
-    if (pkcs12bundle == NULL) {
-        NSLog(@"Error generating a valid PKCS12 certificate.");
-        error = -1;
+    // 5) Serialize
+    NSData *result = nil;
+    if (error == 0) {
+        bio_pkcs12 = BIO_new(BIO_s_mem());
+        bytes = i2d_PKCS12_bio(bio_pkcs12, pkcs12bundle);
+        if (bytes <= 0) {
+            NSLog(@"*** [ReProvision] i2d_PKCS12_bio failed. OpenSSL: %s",
+                  ERR_error_string(ERR_get_error(), NULL));
+            error = -1;
+        } else {
+            len = BIO_get_mem_data(bio_pkcs12, &data);
+            result = [NSData dataWithBytes:data length:len];
+            NSLog(@"[ReProvision] PKCS12 built OK, %ld bytes", len);
+        }
     }
 
-    /*--------------------------------------------------------------*
-     * 7.) we write the PKCS12 structure out to NSData              *
-     *--------------------------------------------------------------*/
+    // 6) Cleanup - PKCS12_free BEFORE the objects it internally references.
+    //    (In practice PKCS12_create copies/encrypts everything into ASN.1 structures,
+    //    so order doesn't strictly matter, but this is the safe order.)
+    if (pkcs12bundle)  PKCS12_free(pkcs12bundle);
+    if (bio_pkcs12)    BIO_free_all(bio_pkcs12);
 
-    bio_pkcs12 = BIO_new(BIO_s_mem());
-    bytes = i2d_PKCS12_bio(bio_pkcs12, pkcs12bundle);
+    if (cacertstack)   sk_X509_pop_free(cacertstack, X509_free);
+    else if (rootCA)   X509_free(rootCA);  // failed before stack was built
 
-    if (bytes <= 0) {
-        NSLog(@"Error writing PKCS12 certificate.");
-        error = -1;
-    }
+    if (chainStack)    sk_X509_pop_free(chainStack, X509_free);  // only if we bailed early
+    if (cert)          X509_free(cert);
+    if (cert_privkey)  EVP_PKEY_free(cert_privkey);
+    if (bio_privkey)   BIO_free_all(bio_privkey);
+    BIO_free_all(rootCABio);
 
-    len = BIO_get_mem_data(bio_pkcs12, &data);
-    NSData *result = [NSData dataWithBytes:data length:len];
-
-    /*--------------------------------------------------------------*
-     * 8.) we are done, let's clean up                              *
-     *--------------------------------------------------------------*/
-
-    X509_free(cert);
-    X509_free(cacert);
-    sk_X509_free(cacertstack);
-    PKCS12_free(pkcs12bundle);
-
-    BIO_free_all(bio_pkcs12);
-    BIO_free_all(bio_certificate);
-    BIO_free_all(bio_privkey);
-
-    if (error == -1) {
-        std::string s("");
-        return s;
+    if (error == -1 || !result) {
+        return std::string("");
     } else {
         std::string s(reinterpret_cast<char const *>([result bytes]), [result length]);
         return s;
     }
+}
+
+// Old entrypoint kept for source compatibility (unused internally now).
+- (std::string)_createPKCS12CertificateWithKey:(NSString *)key certificate:(NSData *)certificate andCAChain:(X509 *)chain {
+    STACK_OF(X509) *stack = sk_X509_new_null();
+    if (chain) sk_X509_push(stack, chain);
+    return [self _createPKCS12CertificateWithKey:key certificate:certificate andCAChainStack:stack];
 }
 
 - (std::string)_createRequirementsBlobWithKey:(NSString *)key certificate:(NSData *)certificate andBundleIdentifier:(NSString *)identifier {
